@@ -2,8 +2,9 @@
 
 Save anything — voice, links, articles, YouTube, GitHub repos, screenshots,
 PDFs, images, notes — into one inbox. AI understands, organizes, connects, and
-makes it searchable. See [ARCHITECTURE.md](./ARCHITECTURE.md) for design and
-the phased build plan.
+makes it searchable. See [CAPABILITIES.md](./CAPABILITIES.md) for the full,
+honest feature list (including what's not built yet) and
+[ARCHITECTURE.md](./ARCHITECTURE.md) for design and the phased build plan.
 
 **Phase 1 (done):** authentication, saved item CRUD, tags, projects.
 **Phase 2 (done):** AI processing pipeline — `AIProvider`/Claude adapter,
