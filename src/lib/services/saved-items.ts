@@ -13,6 +13,7 @@ const savedItemInclude = {
   decisions: true,
   questions: true,
   processingJobs: { orderBy: { createdAt: 'desc' }, take: 1 },
+  audioAttachment: true,
 } satisfies Prisma.SavedItemInclude;
 
 export type SavedItemWithRelations = Prisma.SavedItemGetPayload<{ include: typeof savedItemInclude }>;

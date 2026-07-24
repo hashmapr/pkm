@@ -1,6 +1,8 @@
 // Phase 1: auth + saved items + manual organization (tags/projects) + attachments.
 // Phase 2: AI processing pipeline — ProcessingJob + extracted knowledge
 // (ExtractedTask, ExtractedEntity, Decision, Question).
+// Phase 3: voice capture — AudioAttachment feeds SavedItem.content, then reuses
+// the Phase 2 pipeline unchanged.
 // RelatedItem, Embedding, ChatSession/ChatMessage are planned for Phases 2(follow-up)/4/5
 // — see ARCHITECTURE.md — and are added as their own migrations when those phases start.
 
@@ -83,7 +85,7 @@ model SavedItem {
   createdAt DateTime         @default(now())
   updatedAt DateTime         @updatedAt
 
-  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
   tags        SavedItemTag[]
   projects    SavedItemProject[]
   attachments Attachment[]
@@ -93,10 +95,26 @@ model SavedItem {
   extractedEntities ExtractedEntity[]
   decisions         Decision[]
   questions         Question[]
+  audioAttachment   AudioAttachment?
 
   @@index([userId, createdAt])
   @@index([userId, type])
   @@map("saved_items")
+}
+
+model AudioAttachment {
+  id                  String           @id @default(cuid())
+  savedItemId         String           @unique
+  fileUrl             String // storage key (StorageProvider reference); getUrl(fileUrl) computes a servable URL on demand
+  duration            Int? // seconds
+  transcript          String?
+  transcriptionStatus ProcessingStatus @default(PENDING)
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  savedItem SavedItem @relation(fields: [savedItemId], references: [id], onDelete: Cascade)
+
+  @@map("audio_attachments")
 }
 
 model ProcessingJob {
