@@ -51,6 +51,8 @@ const fakeAIResult: AIExtractionResult = {
   tasks: [{ title: 'Prototype an orchestrator', priority: 'HIGH', confidence: 0.8 }],
   decisions: [{ statement: 'Use a graph-based orchestrator', confidence: 0.7 }],
   questions: [{ question: 'Which framework handles long-running state best?' }],
+  importanceScore: 0.8,
+  saveReason: 'Relates to the agent orchestration project',
 };
 
 const fakeAIProvider: AIProvider = {

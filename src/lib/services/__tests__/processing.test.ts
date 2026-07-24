@@ -18,6 +18,7 @@ const sampleResult: AIExtractionResult = {
   tasks: [],
   decisions: [],
   questions: [],
+  importanceScore: 0.5,
 };
 
 function notImplemented(): never {

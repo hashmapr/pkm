@@ -1,10 +1,11 @@
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getSessionUserId } from '@/lib/auth/session';
-import { getSavedItem } from '@/lib/services/saved-items';
+import { getSavedItem, markSavedItemViewed } from '@/lib/services/saved-items';
 import { findRelatedItems } from '@/lib/services/search';
 import { SAVED_ITEM_TYPE_LABELS } from '@/types/saved-item';
 import { DeleteItemButton } from '@/components/saved-items/delete-item-button';
+import { AddToCollection } from '@/components/collections/add-to-collection';
 
 interface ItemDetailPageProps {
   params: { id: string };
@@ -17,14 +18,23 @@ export default async function ItemDetailPage({ params }: ItemDetailPageProps) {
   const item = await getSavedItem(userId, params.id);
   if (!item) notFound();
 
+  await markSavedItemViewed(userId, params.id);
+
   const relatedItems = await findRelatedItems(userId, params.id);
 
   return (
     <div className="max-w-2xl">
       <div className="flex items-center justify-between">
-        <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600 dark:bg-neutral-800 dark:text-neutral-300">
-          {SAVED_ITEM_TYPE_LABELS[item.type]}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600 dark:bg-neutral-800 dark:text-neutral-300">
+            {SAVED_ITEM_TYPE_LABELS[item.type]}
+          </span>
+          {item.importanceScore !== null && (
+            <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-950 dark:text-amber-300">
+              Importance: {Math.round(item.importanceScore * 100)}%
+            </span>
+          )}
+        </div>
         <div className="flex gap-2">
           <Link
             href={`/items/${item.id}/edit`}
@@ -53,6 +63,12 @@ export default async function ItemDetailPage({ params }: ItemDetailPageProps) {
         Saved {new Date(item.createdAt).toLocaleString()}
       </p>
 
+      {item.saveReason && (
+        <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+          <span className="font-medium">Why this was saved:</span> {item.saveReason}
+        </div>
+      )}
+
       {item.summary && (
         <div className="mt-6">
           <h2 className="text-sm font-medium text-gray-500 dark:text-neutral-400">Summary</h2>
@@ -67,7 +83,7 @@ export default async function ItemDetailPage({ params }: ItemDetailPageProps) {
         </div>
       )}
 
-      {(item.tags.length > 0 || item.projects.length > 0) && (
+      {(item.tags.length > 0 || item.projects.length > 0 || item.collections.length > 0) && (
         <div className="mt-6 flex flex-wrap gap-1.5">
           {item.projects.map(({ project }) => (
             <span
@@ -75,6 +91,15 @@ export default async function ItemDetailPage({ params }: ItemDetailPageProps) {
               className="rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700 dark:bg-blue-950 dark:text-blue-300"
             >
               {project.name}
+            </span>
+          ))}
+          {item.collections.map(({ collection }) => (
+            <span
+              key={collection.id}
+              className="rounded-full bg-purple-50 px-2 py-0.5 text-xs text-purple-700 dark:bg-purple-950 dark:text-purple-300"
+            >
+              {collection.emoji ? `${collection.emoji} ` : ''}
+              {collection.name}
             </span>
           ))}
           {item.tags.map(({ tag }) => (
@@ -87,6 +112,8 @@ export default async function ItemDetailPage({ params }: ItemDetailPageProps) {
           ))}
         </div>
       )}
+
+      <AddToCollection savedItemId={item.id} currentCollectionIds={item.collections.map((c) => c.collection.id)} />
 
       {relatedItems.length > 0 && (
         <div className="mt-8">

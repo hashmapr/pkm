@@ -87,28 +87,34 @@ model User {
   tags          Tag[]
   projects      Project[]
   conversations Conversation[]
+  collections   Collection[]
 
   @@map("users")
 }
 
 model SavedItem {
-  id        String           @id @default(cuid())
-  userId    String
-  type      SavedItemType
-  title     String
-  source    String? // URL, file path, or null for freeform notes
-  content   String? // raw or extracted text content
-  summary   String?
-  keyPoints String[] // AI-extracted key points (Phase 2)
-  status    ProcessingStatus @default(PENDING)
-  metadata  Json? // type-specific raw fields (e.g. github stars, video duration)
-  createdAt DateTime         @default(now())
-  updatedAt DateTime         @updatedAt
+  id              String           @id @default(cuid())
+  userId          String
+  type            SavedItemType
+  title           String
+  source          String? // URL, file path, or null for freeform notes
+  content         String? // raw or extracted text content
+  summary         String?
+  keyPoints       String[] // AI-extracted key points (Phase 2)
+  status          ProcessingStatus @default(PENDING)
+  metadata        Json? // type-specific raw fields (e.g. github stars, video duration,
+  // capture-provider extraction data — YouTube chapters, GitHub languages, webpage author, etc.)
+  importanceScore Float? // Albo layer: AI-estimated 0-1, produced by the existing analyze() call
+  saveReason      String? // Albo layer: AI-suggested "why this was saved," user-editable
+  lastViewedAt    DateTime? // Albo layer: set when the item detail page is opened; powers "forgotten items"
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
 
-  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user        User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
   tags        SavedItemTag[]
   projects    SavedItemProject[]
   attachments Attachment[]
+  collections SavedItemCollection[]
 
   processingJobs    ProcessingJob[]
   extractedTasks    ExtractedTask[]
@@ -145,12 +151,12 @@ model AudioAttachment {
 // is added in a follow-up migration — Prisma's schema DSL can't express a
 // vector index's operator class.
 model Embedding {
-  id         String              @id @default(cuid())
+  id         String                      @id @default(cuid())
   entityType EmbeddingEntityType
   entityId   String
   vector     Unsupported("vector(1536)")
   model      String
-  createdAt  DateTime            @default(now())
+  createdAt  DateTime                    @default(now())
 
   @@unique([entityType, entityId])
   @@map("embeddings")
@@ -325,4 +331,37 @@ model Message {
 
   @@index([conversationId, createdAt])
   @@map("messages")
+}
+
+// Albo-inspired layer: a lighter, more casual organizing layer than
+// Project — no description requirement, an emoji "cover" instead of a
+// photo upload, and a flag distinguishing user-created from AI-suggested
+// collections. See ALBO_ANALYSIS.md / ALBO_INTEGRATION_PLAN.md.
+model Collection {
+  id            String   @id @default(cuid())
+  userId        String
+  name          String
+  description   String?
+  emoji         String?
+  isAiSuggested Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user  User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items SavedItemCollection[]
+
+  @@unique([userId, name])
+  @@map("collections")
+}
+
+model SavedItemCollection {
+  savedItemId  String
+  collectionId String
+  addedAt      DateTime @default(now())
+
+  savedItem  SavedItem  @relation(fields: [savedItemId], references: [id], onDelete: Cascade)
+  collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+
+  @@id([savedItemId, collectionId])
+  @@map("saved_item_collections")
 }

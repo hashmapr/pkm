@@ -55,6 +55,30 @@ describe('parseExtractionResponse — AI response parsing', () => {
   });
 });
 
+describe('parseExtractionResponse — Albo layer fields (importanceScore, saveReason)', () => {
+  it('parses importanceScore and saveReason when present', () => {
+    const withAlbo = { ...validResponse, importanceScore: 0.9, saveReason: 'Relates to the current project' };
+    const result = parseExtractionResponse(JSON.stringify(withAlbo));
+    expect(result.importanceScore).toBe(0.9);
+    expect(result.saveReason).toBe('Relates to the current project');
+  });
+
+  it('defaults importanceScore to 0.5 when omitted', () => {
+    const result = parseExtractionResponse(JSON.stringify(validResponse));
+    expect(result.importanceScore).toBe(0.5);
+  });
+
+  it('leaves saveReason undefined when omitted', () => {
+    const result = parseExtractionResponse(JSON.stringify(validResponse));
+    expect(result.saveReason).toBeUndefined();
+  });
+
+  it('rejects an importanceScore outside 0-1', () => {
+    const bad = { ...validResponse, importanceScore: 1.5 };
+    expect(() => parseExtractionResponse(JSON.stringify(bad))).toThrow(AIResponseValidationError);
+  });
+});
+
 describe('parseExtractionResponse — failed AI responses', () => {
   it('throws AIResponseValidationError on malformed JSON', () => {
     expect(() => parseExtractionResponse('{ not valid json')).toThrow(AIResponseValidationError);

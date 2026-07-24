@@ -18,6 +18,7 @@ structured, searchable **Saved Item**.
 | Embeddings | Provider abstraction in `src/lib/embeddings/` (Phase 4) | `EmbeddingProvider` interface + OpenAI (`text-embedding-3-small`) adapter — its own abstraction, same reasoning as Transcription vs. AI. |
 | Vector search | pgvector (Phase 4) | Same Postgres instance as everything else; `Unsupported("vector(1536)")` column + raw SQL for similarity queries, HNSW index for cosine distance. |
 | AI assistant | Provider abstraction in `src/lib/assistant/` (Phase 5) | `AssistantProvider` interface + Claude adapter — its own abstraction (not new `AIProvider` methods), same reasoning as Transcription/Embeddings: different capability, independently swappable, even though currently the same vendor. |
+| Universal capture | Provider abstraction in `src/lib/capture/` (Albo layer, Sub-Phase A) | `CaptureProvider` interface (`supports`/`capture`) + a registry, so adding a new source type (web, YouTube, GitHub, PDF, image) means writing one provider and registering it — no call-site changes to `POST /api/capture`. |
 
 **Layering rule:** route handlers stay thin (parse request → call a service in
 `src/lib/services` → return response). All business logic lives in services so
@@ -25,9 +26,11 @@ UI, API, and future background jobs can all call the same code path.
 
 ## Database schema
 
-Phase 1 through Phase 5 are all migrated today — this schema is now complete
-relative to the original phased plan; only genuinely new future work (see
-Follow-up, below) would add more.
+Phase 1 through Phase 5 are all migrated, plus Sub-Phase A of the
+Albo-inspired layer (see [ALBO_ANALYSIS.md](./ALBO_ANALYSIS.md) /
+[ALBO_INTEGRATION_PLAN.md](./ALBO_INTEGRATION_PLAN.md) for that layer's own
+research and design). Everything below is additive — no existing model was
+rewritten to build any of it.
 
 ```
 User             id, email, passwordHash, name, createdAt
@@ -80,6 +83,16 @@ Embedding        id, entityType (SAVED_ITEM|EXTRACTED_TASK|DECISION|QUESTION|ENT
 Conversation     id, userId, title (nullable), createdAt, updatedAt
 Message          id, conversationId, role (USER|ASSISTANT), content,
                  sourcesUsed (jsonb — see below), createdAt
+
+-- Albo-inspired layer, Sub-Phase A --
+Collection       id, userId, name, description, emoji, isAiSuggested,
+                 createdAt, updatedAt — @@unique([userId, name])
+                 — a lighter, more casual organizing layer than Project
+SavedItemCollection savedItemId, collectionId, addedAt
+SavedItem (additive): importanceScore (float, AI-estimated), saveReason
+                 (AI-suggested "why this was saved," user-editable, never
+                 silently overwritten by a reprocess), lastViewedAt (set on
+                 item-detail view; powers "forgotten items," Sub-Phase D)
 
 -- Superseded, never migrated --
 RelatedItem      superseded by Phase 4 embedding similarity — see "Related
@@ -134,8 +147,10 @@ src/
 │   │   ├── retrieval.ts         — Phase 5: multi-entity-type context retrieval for chat
 │   │   ├── assistant-chat.ts    — Phase 5: RAG orchestration (retrieve, guard, call, persist)
 │   │   ├── conversations.ts     — Phase 5: list/fetch conversations
-│   │   └── knowledge-actions.ts — Phase 5: the only place a confirmed suggested action writes to the DB
-│   ├── validation/          — zod schemas (auth, saved-item, search, assistant)
+│   │   ├── knowledge-actions.ts — Phase 5: the only place a confirmed suggested action writes to the DB
+│   │   ├── collections.ts       — Albo layer: Collection CRUD, add/remove items
+│   │   └── capture.ts           — Albo layer: dispatches through CaptureProvider registry, then createSavedItem
+│   ├── validation/          — zod schemas (auth, saved-item, search, assistant, collections, capture)
 │   ├── ai/                  — Phase 2: AIProvider abstraction
 │   │   ├── types.ts         — AIProvider interface
 │   │   ├── extraction.ts    — zod schemas + strict-JSON response parsing
@@ -156,6 +171,12 @@ src/
 │       ├── claude-assistant-provider.ts
 │       ├── errors.ts        — AssistantProviderError, AssistantResponseValidationError
 │       └── index.ts         — getAssistantProvider() factory
+├── capture/                 — Albo layer: CaptureProvider abstraction
+│   ├── types.ts             — CaptureProvider interface (supports/capture)
+│   ├── errors.ts            — NoCaptureProviderError, CaptureProviderError
+│   ├── registry.ts          — CaptureProviderRegistry (ordered, first-match dispatch)
+│   ├── providers/note-provider.ts — the only concrete provider so far (plain text fallback)
+│   └── index.ts             — getCaptureRegistry() factory
 ├── middleware.ts             — route protection
 └── types/{saved-item.ts, search.ts, assistant.ts}
 ```
@@ -390,6 +411,60 @@ naming rather than treating as a non-event. Conversations and messages are
 stored in plaintext in our own Postgres, consistent with `SavedItem.content`
 — no new encryption is introduced here, and none existed before.
 
+## Albo-inspired layer, Sub-Phase A (universal capture + collections)
+
+Research and full design in [ALBO_ANALYSIS.md](./ALBO_ANALYSIS.md) and
+[ALBO_INTEGRATION_PLAN.md](./ALBO_INTEGRATION_PLAN.md) — this section covers
+what's actually built so far (Sub-Phase A of that plan; B-F are follow-up
+work).
+
+```
+POST /api/capture  { url? | text?, title?, tags?, projects? }
+        ↓
+  CaptureProviderRegistry.capture(input) — first registered provider whose
+  supports() matches; today that's only NoteCaptureProvider (plain text,
+  no url, no file) — URL dispatch (Web/YouTube/GitHub) lands in Sub-Phase B
+        ↓
+  createSavedItem() — the exact same function manual creation already uses;
+  same tag/project handling, same automatic ProcessingJob queuing
+```
+
+This is deliberately the smallest possible slice that makes the
+`CaptureProvider` abstraction real rather than aspirational: one concrete
+provider today, proven end-to-end (register → dispatch → `SavedItem` →
+existing processing pipeline), with the exact seam (`registry.register(...)`)
+where Sub-Phase B's Web/YouTube/GitHub providers plug in without touching
+`POST /api/capture` at all.
+
+**Collections** (`Collection`/`SavedItemCollection`) are additive alongside
+`Tag`/`Project`, not a replacement for either — a lighter, more casual
+organizing layer (see ALBO_ANALYSIS.md for why Albo's collections don't map
+1:1 onto `Project`). CRUD + add/remove-item endpoints under
+`/api/collections`, a `/collections` list/detail UI, and an "Add to
+collection" control on the item detail page.
+
+**`importanceScore`/`saveReason`** extend the *existing* `AIProvider.analyze()`
+strict-JSON schema — two new fields, not a new AI call. `saveReason` follows
+the same non-clobbering principle as Phase 2's tag-merge: a reprocess never
+overwrites a value that's already set (whether AI-set the first time or
+user-edited afterward), since there's no way to distinguish "AI's original
+guess" from "the user's edit" without a new flag not built in this
+sub-phase — the closest safe default is simply "never overwrite a
+non-null value."
+
+**`lastViewedAt`** is set when the item detail page loads
+(`markSavedItemViewed`), inside the page's server component, not the read
+endpoint (`getSavedItem` stays a pure read) — this is what will power
+"forgotten items" in Sub-Phase D's rediscovery system.
+
+**Recurring migration hazard, hit again:** the Sub-Phase A migration for
+`Collection`/`SavedItemCollection` auto-generated a `DROP INDEX` on the
+Phase 4 hand-written HNSW vector index — the same issue flagged in Phase 5,
+now confirmed as a genuine recurring pattern rather than a one-off. Every
+future `prisma migrate dev` touching this schema needs the same manual
+review of the generated SQL before applying it. Fixed the same way: strip
+the erroneous drop, add a small restore migration.
+
 ## Risks
 
 1. **AI cost/latency** — `analyze()` is one call per item, but there's no retry/backoff yet on transient upstream failures (a timeout just fails the job; the user has to manually re-trigger `/process`).
@@ -406,6 +481,8 @@ stored in plaintext in our own Postgres, consistent with `SavedItem.content`
 12. **No query-rewriting for follow-up questions** — see "Context limits" above. A genuinely ambiguous follow-up ("what about the other one?") may retrieve poorly since retrieval doesn't benefit from conversation context, only the model's answer does.
 13. **`confidence` is model-self-reported**, not an independently computed or calibrated score — treat it as the model's own hedge, not a statistical guarantee.
 14. **Assistant-turn cost is the highest per-call cost in the app so far**: one embedding call (the question) plus one Claude call with several sources' worth of text in the prompt, per message. Still cheap in absolute terms at personal-app volume, but the most expensive single interaction available in the product.
+15. **Hand-rolled index migrations, 2nd confirmed occurrence**: Sub-Phase A's `Collection`/`SavedItemCollection` migration hit the exact same auto-`DROP INDEX` issue described in risk #11, this time during a routine schema addition with no vector-related changes at all — proof it's not tied to touching embedding-adjacent models, but to *any* migration in a schema that contains the hand-written HNSW index. The mitigation (manual review + strip-and-restore) is unchanged, but the recurrence means this should be treated as a standing checklist item for every future migration, not a rare edge case.
+16. **`CaptureProviderRegistry` has exactly one concrete provider (`NoteCaptureProvider`) as of Sub-Phase A** — any URL or file capture currently 422s with "nothing can capture this input yet." This is intentional scaffolding (Sub-Phase B adds `WebProvider`/`YouTubeProvider`/`GitHubProvider`), but it means `POST /api/capture` is not yet the universal entry point the Albo layer is aiming for.
 
 ## Implementation plan
 
@@ -414,4 +491,5 @@ stored in plaintext in our own Postgres, consistent with `SavedItem.content`
 - **Phase 3 (done):** `StorageProvider`/`LocalStorageProvider`, `TranscriptionProvider`/Whisper adapter, `AudioAttachment` table, `POST /api/audio/upload` + `POST /api/items/:id/transcribe` (auto-triggers the Phase 2 pipeline on success). Tests for successful/failed transcription, missing audio, and one live-DB-guarded pipeline-integration test. Still no UI — no recording/upload widget yet.
 - **Phase 4 (done):** `EmbeddingProvider`/OpenAI adapter, `Embedding` table (pgvector, HNSW index), automatic indexing on processing completion, `GET /api/search` with type/project/tag/date filters, `GET /api/items/:id/related`, global search bar + `/search` results page + related-items section on the item detail page. Tests for text-building, embedding success/failure, empty queries, and one live-DB-guarded test proving real cosine-similarity ranking with a deterministic fake embedding.
 - **Phase 5 (done):** `AssistantProvider`/Claude adapter, `Conversation`/`Message` tables, retrieval-augmented chat (`POST /api/assistant/messages`, `GET /api/assistant/conversations[/:id]`) with source-index validation against fabricated citations, `POST /api/assistant/actions/confirm` for user-confirmed knowledge actions (create task/decision/project, add reminder), a `/chat` page with conversation history, source/related-item cards, confidence, and confirm buttons. Tests for schema parsing, provider dispatch/failure per mode, source-index validation, and one live-DB-guarded test covering retrieval accuracy, missing-information short-circuiting, hallucination prevention, source attribution, and multi-turn conversation history.
+- **Sub-Phase A (done):** Albo-inspired universal capture layer, first slice. `Collection`/`SavedItemCollection` schema plus additive `SavedItem` fields (`metadata`, `importanceScore`, `saveReason`, `lastViewedAt`); `CaptureProvider`/`CaptureProviderRegistry`/`NoteCaptureProvider` abstraction and `POST /api/capture`; Collections CRUD (`/api/collections[/:id][/items[/:savedItemId]]`) plus a `/collections` list/detail UI and an "Add to collection" control on the item detail page; `analyze()`'s schema extended with `importanceScore`/`saveReason` (non-clobbering on reprocess); `markSavedItemViewed` wired into the item detail page. Tests for registry dispatch/`NoteCaptureProvider` behavior, the new AI-response fields, and one live-DB-guarded collections-integration test. See `ALBO_ANALYSIS.md` and `ALBO_INTEGRATION_PLAN.md` for the research and full Sub-Phase A-F roadmap; B (real Web/YouTube/GitHub providers), C (image/PDF), D (rediscovery), E (UI polish), F (tests+docs pass) are not started.
 - **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer.

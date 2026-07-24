@@ -68,6 +68,10 @@ export const aiExtractionResultSchema = z.object({
   tasks: z.array(extractedTaskSchema).default([]),
   decisions: z.array(decisionSchema).default([]),
   questions: z.array(questionSchema).default([]),
+  // Albo-inspired layer (see ALBO_INTEGRATION_PLAN.md) — same analyze() call,
+  // two additional fields, not a separate AI request.
+  importanceScore: confidence.default(0.5),
+  saveReason: z.string().trim().min(1).optional(),
 });
 
 export type AIExtractionResult = z.infer<typeof aiExtractionResultSchema>;

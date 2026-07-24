@@ -18,12 +18,20 @@ pgvector-backed `Embedding` table indexed automatically when processing
 completes, a global search bar, `/search` results page with type/date/
 project/tag filters, and a "Related items" section powered by embedding
 similarity.
-**Phase 5 (current):** AI assistant — `AssistantProvider`/Claude adapter,
+**Phase 5 (done):** AI assistant — `AssistantProvider`/Claude adapter,
 retrieval-augmented chat over your saved knowledge with source citations,
 confidence scores, and user-confirmed knowledge actions (create a task,
 save a decision, create a project, add a reminder — nothing executes without
-an explicit confirm click). `/chat` page with conversation history. See
-ARCHITECTURE.md for the full design.
+an explicit confirm click). `/chat` page with conversation history.
+**Sub-Phase A (current):** first slice of an Albo-inspired universal capture
+layer — `Collection`/`SavedItemCollection` for lightweight manual grouping
+alongside tags/projects, a `CaptureProvider` abstraction behind
+`POST /api/capture` (currently just plain-text notes; URL/file capture lands
+in later sub-phases), and two new AI-derived fields on each item —
+`importanceScore` and a plain-language `saveReason` ("why this was saved").
+See ALBO_ANALYSIS.md and ALBO_INTEGRATION_PLAN.md for the research behind
+this and the full Sub-Phase A-F roadmap, and ARCHITECTURE.md for the full
+design.
 
 ## Setup
 
@@ -83,6 +91,26 @@ curl -b cookies.txt -X POST http://localhost:3000/api/assistant/actions/confirm 
 Or just use the `/chat` page, with the mode buttons (Ask / Summarize /
 Compare / Find conflicts) above the input box.
 
+Capture a plain-text note through the universal capture endpoint, and manage
+collections:
+
+```bash
+curl -b cookies.txt -X POST http://localhost:3000/api/capture \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Idea: try a graph-based agent orchestrator"}'
+# -> { "item": { "id": "...", "type": "NOTE", ... } }
+# a "url" instead of "text" currently 422s — no URL capture provider yet
+
+curl -b cookies.txt -X POST http://localhost:3000/api/collections \
+  -H "Content-Type: application/json" -d '{"name":"AI","emoji":"🤖"}'
+curl -b cookies.txt -X POST http://localhost:3000/api/collections/<id>/items \
+  -H "Content-Type: application/json" -d '{"savedItemId":"<item id>"}'
+curl -b cookies.txt http://localhost:3000/api/collections/<id>
+```
+
+Or just use the `/collections` page, and the "Add to collection" control on
+any item's detail page.
+
 ## Testing
 
 ```bash
@@ -95,16 +123,20 @@ validation, local storage read/write/delete, transcription
 success/failure/missing-audio, embedding text-building and success/failure
 handling, the search service's empty-query guard and highlight logic, and
 the assistant's response parsing, per-mode provider dispatch/failure, and
-source-index validation (the hallucination-prevention mechanism) — all
-against pure functions and fake providers, no live database or network call
-required.
+source-index validation (the hallucination-prevention mechanism), the
+`CaptureProviderRegistry`'s dispatch order/no-match behavior and
+`NoteCaptureProvider`'s title derivation, and the new `importanceScore`/
+`saveReason` fields on the AI extraction schema — all against pure functions
+and fake providers, no live database or network call required.
 
-Three tests need a real database (pgvector) and skip cleanly if none is
+Four tests need a real database (pgvector) and skip cleanly if none is
 reachable: `audio-pipeline.integration.test.ts` (transcribe → content update
 → processing pipeline), `search.integration.test.ts` (real cosine-similarity
 ranking via pgvector using a deterministic hashed-text fake embedding, plus
-filter narrowing and the related-items query), and
+filter narrowing and the related-items query),
 `assistant-chat.integration.test.ts` (retrieval accuracy, missing-information
 short-circuiting, dropping a fabricated source citation, and multi-turn
 conversation history — same deterministic fake embedding, no live embedding
-or Claude call needed).
+or Claude call needed), and `collections.integration.test.ts` (create/list
+with item counts, idempotent add/remove, and cross-user access checks via
+`CollectionNotFoundError`).

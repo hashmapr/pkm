@@ -23,7 +23,9 @@ Return JSON matching exactly this shape:
   "entities": [{ "name": string, "type": "PERSON"|"COMPANY"|"TECHNOLOGY"|"PROJECT"|"BOOK"|"URL"|"CONCEPT", "confidence": number 0-1 }],
   "tasks": [{ "title": string, "description": string?, "priority": "LOW"|"MEDIUM"|"HIGH", "dueDate": string (ISO 8601) | null, "confidence": number 0-1 }],
   "decisions": [{ "statement": string, "reasoning": string?, "confidence": number 0-1 }],
-  "questions": [{ "question": string }]
+  "questions": [{ "question": string }],
+  "importanceScore": number 0-1 (how significant/worth-remembering this item seems),
+  "saveReason": string? (a short, specific sentence on why this was worth saving / why it matters — omit if genuinely unclear)
 }`;
 }
 

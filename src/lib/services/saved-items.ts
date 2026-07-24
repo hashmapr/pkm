@@ -14,6 +14,7 @@ const savedItemInclude = {
   questions: true,
   processingJobs: { orderBy: { createdAt: 'desc' }, take: 1 },
   audioAttachment: true,
+  collections: { include: { collection: true } },
 } satisfies Prisma.SavedItemInclude;
 
 export type SavedItemWithRelations = Prisma.SavedItemGetPayload<{ include: typeof savedItemInclude }>;
@@ -62,6 +63,11 @@ export async function getSavedItem(userId: string, id: string) {
   return db.savedItem.findFirst({ where: { id, userId }, include: savedItemInclude });
 }
 
+/** Marks an item as viewed — powers the "forgotten items" rediscovery query. */
+export async function markSavedItemViewed(userId: string, id: string): Promise<void> {
+  await db.savedItem.updateMany({ where: { id, userId }, data: { lastViewedAt: new Date() } });
+}
+
 export interface SavedItemInput {
   type: SavedItemType;
   title: string;
@@ -69,6 +75,8 @@ export interface SavedItemInput {
   content?: string;
   tags?: string[];
   projects?: string[];
+  saveReason?: string;
+  metadata?: Prisma.InputJsonValue;
 }
 
 export async function createSavedItem(userId: string, input: SavedItemInput) {
@@ -84,6 +92,8 @@ export async function createSavedItem(userId: string, input: SavedItemInput) {
       title: input.title,
       source: input.source,
       content: input.content,
+      saveReason: input.saveReason,
+      metadata: input.metadata,
       tags: { create: tagIds.map((tagId) => ({ tagId })) },
       projects: { create: projectIds.map((projectId) => ({ projectId })) },
     },
@@ -103,6 +113,7 @@ export async function updateSavedItem(userId: string, id: string, input: Partial
     ...(input.title !== undefined ? { title: input.title } : {}),
     ...(input.source !== undefined ? { source: input.source } : {}),
     ...(input.content !== undefined ? { content: input.content } : {}),
+    ...(input.saveReason !== undefined ? { saveReason: input.saveReason } : {}),
   };
 
   if (input.tags !== undefined) {

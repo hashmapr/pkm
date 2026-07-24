@@ -19,6 +19,7 @@ export const createSavedItemSchema = z.object({
   content: z.string().max(200_000).optional(),
   tags: z.array(z.string().trim().min(1).max(50)).max(50).optional(),
   projects: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+  saveReason: z.string().trim().max(500).optional(),
 });
 
 export const updateSavedItemSchema = createSavedItemSchema.partial();

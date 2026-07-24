@@ -67,6 +67,7 @@ async function persistExtractionResult(
   userId: string,
   savedItemId: string,
   result: AIExtractionResult,
+  existingSaveReason: string | null,
 ): Promise<void> {
   const tagIds = await upsertTagsByName(userId, result.tags);
 
@@ -77,6 +78,12 @@ async function persistExtractionResult(
         summary: result.summary,
         keyPoints: result.keyPoints,
         status: 'COMPLETED',
+        importanceScore: result.importanceScore,
+        // A user-edited saveReason should never be silently clobbered by a
+        // reprocess — same principle as the tag-merge below. Only ever set
+        // by AI the first time; a null existing value is the "never edited,
+        // never set" state.
+        saveReason: existingSaveReason ?? result.saveReason,
       },
     }),
     // AI-generated tags are merged in alongside any the user already set —
@@ -158,7 +165,7 @@ export async function runProcessingJob(
     return failJob(jobId, savedItem.id, outcome.error);
   }
 
-  await persistExtractionResult(savedItem.userId, savedItem.id, outcome.data);
+  await persistExtractionResult(savedItem.userId, savedItem.id, outcome.data, savedItem.saveReason);
 
   const completedJob = await db.processingJob.update({
     where: { id: jobId },
