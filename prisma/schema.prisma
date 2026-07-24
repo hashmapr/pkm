@@ -5,8 +5,10 @@
 // the Phase 2 pipeline unchanged.
 // Phase 4: semantic search — Embedding (pgvector) indexed automatically when
 // AI processing completes.
-// RelatedItem, ChatSession/ChatMessage are planned for Phase 2(follow-up)/5
-// — see ARCHITECTURE.md — and are added as their own migrations when those phases start.
+// Phase 5: AI assistant — Conversation/Message, retrieval-augmented chat over
+// the same Embedding index.
+// RelatedItem (Phase 2 follow-up, superseded by Phase 4 embedding similarity)
+// remains unmigrated — see ARCHITECTURE.md.
 
 generator client {
   provider        = "prisma-client-js"
@@ -68,6 +70,11 @@ enum EmbeddingEntityType {
   ENTITY
 }
 
+enum MessageRole {
+  USER
+  ASSISTANT
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -76,9 +83,10 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  savedItems SavedItem[]
-  tags       Tag[]
-  projects   Project[]
+  savedItems    SavedItem[]
+  tags          Tag[]
+  projects      Project[]
+  conversations Conversation[]
 
   @@map("users")
 }
@@ -282,4 +290,39 @@ model SavedItemProject {
 
   @@id([savedItemId, projectId])
   @@map("saved_item_projects")
+}
+
+// Phase 5: AI assistant conversations. Not tied to SavedItem — a
+// conversation can range across many saved items via retrieval, so it
+// belongs to the user directly, like Tag/Project.
+model Conversation {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([userId, updatedAt])
+  @@map("conversations")
+}
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String
+  role           MessageRole
+  content        String
+  // Full structured response snapshot for ASSISTANT messages: cited
+  // sources, related (uncited) items, confidence, suggested actions — one
+  // JSON blob since they're produced together by one assistant turn and
+  // read together by the UI. Null for USER messages.
+  sourcesUsed    Json?
+  createdAt      DateTime    @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
 }

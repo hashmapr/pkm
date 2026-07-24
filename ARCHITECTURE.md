@@ -17,6 +17,7 @@ structured, searchable **Saved Item**.
 | Transcription | Provider abstraction in `src/lib/transcription/` (Phase 3) | `TranscriptionProvider` interface + Whisper adapter — deliberately separate from `AIProvider` since it's a different capability from a different vendor. |
 | Embeddings | Provider abstraction in `src/lib/embeddings/` (Phase 4) | `EmbeddingProvider` interface + OpenAI (`text-embedding-3-small`) adapter — its own abstraction, same reasoning as Transcription vs. AI. |
 | Vector search | pgvector (Phase 4) | Same Postgres instance as everything else; `Unsupported("vector(1536)")` column + raw SQL for similarity queries, HNSW index for cosine distance. |
+| AI assistant | Provider abstraction in `src/lib/assistant/` (Phase 5) | `AssistantProvider` interface + Claude adapter — its own abstraction (not new `AIProvider` methods), same reasoning as Transcription/Embeddings: different capability, independently swappable, even though currently the same vendor. |
 
 **Layering rule:** route handlers stay thin (parse request → call a service in
 `src/lib/services` → return response). All business logic lives in services so
@@ -24,9 +25,9 @@ UI, API, and future background jobs can all call the same code path.
 
 ## Database schema
 
-Phase 1 + Phase 2 + Phase 3 + Phase 4 are migrated today; the rest is the
-planned shape for later phases so schema changes stay additive, not
-restructuring.
+Phase 1 through Phase 5 are all migrated today — this schema is now complete
+relative to the original phased plan; only genuinely new future work (see
+Follow-up, below) would add more.
 
 ```
 User             id, email, passwordHash, name, createdAt
@@ -75,11 +76,14 @@ Embedding        id, entityType (SAVED_ITEM|EXTRACTED_TASK|DECISION|QUESTION|ENT
                    follow-up migration since Prisma's schema DSL has no
                    operator-class syntax for vector indexes.
 
--- Planned, not yet migrated --
-RelatedItem      superseded — see "Related Items" below; embedding similarity
-                 answers this without a persisted graph or an LLM call
-ChatSession /
-ChatMessage      (Phase 5) userId, role, content, citations (jsonb)
+-- Phase 5: AI assistant --
+Conversation     id, userId, title (nullable), createdAt, updatedAt
+Message          id, conversationId, role (USER|ASSISTANT), content,
+                 sourcesUsed (jsonb — see below), createdAt
+
+-- Superseded, never migrated --
+RelatedItem      superseded by Phase 4 embedding similarity — see "Related
+                 Items" in the Phase 4 section; no persisted graph or LLM call needed
 ```
 
 **Change from the original Phase 2 plan:** the first sketch had entities as
@@ -101,15 +105,23 @@ simpler, and cross-item lookup ("what else mentions LangGraph?") is just
   the API response but isn't persisted. Worth adding if debugging failed
   transcriptions becomes a real need — same pattern as `ProcessingJob.error`.
 
+**Two Phase 5 additions beyond the literal field list:** `userId` on
+`Conversation` (ownership scoping — structurally required, the same judgment
+call as every prior phase's necessary additions) and `conversationId` on
+`Message` (the FK that makes "which conversation" mean anything). `sourcesUsed`
+is one JSON blob — `{ sources, relatedItems, confidence, suggestedActions }`
+— rather than separate columns for each, because they're produced together by
+one assistant turn and read together by the UI on every reload.
+
 ## Folder structure
 
 ```
 src/
 ├── app/
 │   ├── (auth)/login, register            — public
-│   ├── (app)/inbox, items/[id], (edit), projects, layout.tsx  — authenticated
-│   └── api/auth/*, items/*, tags, projects/route.ts
-├── components/{layout, saved-items, projects}
+│   ├── (app)/inbox, items/[id], (edit), projects, search, chat/[id], layout.tsx — authenticated
+│   └── api/auth/*, items/*, tags, projects, search, audio/*, assistant/*
+├── components/{layout, saved-items, projects, search, chat}
 ├── lib/
 │   ├── db.ts                — Prisma client singleton
 │   ├── auth/{password.ts, session.ts}
@@ -118,8 +130,12 @@ src/
 │   │   ├── processing.ts        — Phase 2 pipeline (job creation + execution)
 │   │   ├── audio.ts             — Phase 3: upload + transcription, triggers processing.ts
 │   │   ├── embedding-index.ts   — Phase 4: text-building + upsert/cleanup, called from processing.ts
-│   │   └── search.ts            — Phase 4: search + related-items queries
-│   ├── validation/          — zod schemas (auth, saved-item, search)
+│   │   ├── search.ts            — Phase 4: /api/search + related-items queries
+│   │   ├── retrieval.ts         — Phase 5: multi-entity-type context retrieval for chat
+│   │   ├── assistant-chat.ts    — Phase 5: RAG orchestration (retrieve, guard, call, persist)
+│   │   ├── conversations.ts     — Phase 5: list/fetch conversations
+│   │   └── knowledge-actions.ts — Phase 5: the only place a confirmed suggested action writes to the DB
+│   ├── validation/          — zod schemas (auth, saved-item, search, assistant)
 │   ├── ai/                  — Phase 2: AIProvider abstraction
 │   │   ├── types.ts         — AIProvider interface
 │   │   ├── extraction.ts    — zod schemas + strict-JSON response parsing
@@ -131,10 +147,17 @@ src/
 │   │   ├── types.ts, errors.ts, local-provider.ts, index.ts
 │   ├── transcription/       — Phase 3: TranscriptionProvider abstraction
 │   │   ├── types.ts, errors.ts, whisper-provider.ts, index.ts
-│   └── embeddings/          — Phase 4: EmbeddingProvider abstraction
-│       ├── types.ts, errors.ts, openai-provider.ts, index.ts
+│   ├── embeddings/          — Phase 4: EmbeddingProvider abstraction
+│   │   ├── types.ts, errors.ts, openai-provider.ts, index.ts
+│   └── assistant/           — Phase 5: AssistantProvider abstraction
+│       ├── types.ts         — AssistantProvider interface, ContextSource, SuggestedAction
+│       ├── schemas.ts       — zod schema + strict-JSON response parsing
+│       ├── prompts.ts       — prompt templates per mode (answer/summarize/compare/find-conflicts)
+│       ├── claude-assistant-provider.ts
+│       ├── errors.ts        — AssistantProviderError, AssistantResponseValidationError
+│       └── index.ts         — getAssistantProvider() factory
 ├── middleware.ts             — route protection
-└── types/{saved-item.ts, search.ts}
+└── types/{saved-item.ts, search.ts, assistant.ts}
 ```
 
 ## Processing pipeline (Phase 2)
@@ -277,6 +300,96 @@ phase since it wasn't asked for and is easy to add later (call
 `processSavedItem` — or just `indexSavedItemEmbeddings` directly — over every
 existing item once).
 
+## AI assistant (Phase 5)
+
+```
+User question (+ conversationId if a follow-up)
+        ↓
+  persist as a USER Message; if this is a new conversation, its title
+  becomes the first ~80 chars of the question
+        ↓
+  retrieveContextForQuestion: same 5-entity-type UNION ALL as Phase 4's
+  /api/search, but returns full-length labels (not search highlights) and
+  no filters — top 8 by cosine similarity, userId-scoped
+        ↓
+  guard: zero results → canned "I don't have saved information about that
+         yet" answer, AssistantProvider never called
+        ↓
+  AssistantProvider.answerQuestion / summarizeKnowledge / compareKnowledge /
+  findConflicts (dispatched by `mode`, all four share this same retrieval +
+  persistence path — only the prompt differs)
+        ↓
+  strict JSON: { answer, sourceIndexes (1-based, into the numbered context
+                 list), confidence, suggestedActions }
+        ↓
+  validateSourceIndexes: drop any index outside [1, context.length] — the
+  concrete server-side defense against a fabricated citation
+        ↓
+  persist ASSISTANT Message; sourcesUsed = { sources: cited context entries,
+  relatedItems: uncited context entries, confidence, suggestedActions }
+```
+
+**Why numbered indexes instead of asking the model to echo real ids:** models
+reliably cite "source 2 and 4" from a list just shown to them, and
+unreliably reproduce an exact opaque string id without typos. An index is
+either in range or it isn't — trivial to validate, impossible to spoof past
+that check.
+
+**Retrieval reuses Phase 4's embeddings and Phase 4's multi-entity-type
+query shape**, not a new index or a new embedding pass. A `Decision` or
+`ExtractedTask` can be its own cited source, distinct from its parent
+`SavedItem` — matching the phase's own example ("Sources: Recording from
+July 12, GitHub repository, Decision entry," where the decision is listed
+separately from its parent item).
+
+**Hallucination prevention is three mechanisms, not one prompt request:**
+1. The structural guard above — no retrieved context means the LLM is never
+   called, so it's structurally unable to fill the gap from general
+   knowledge, regardless of what the prompt says.
+2. `validateSourceIndexes` — a citation outside the real, retrieved list is
+   dropped server-side, never trusted into the rendered UI.
+3. The system prompt's explicit instruction to answer only from the
+   numbered sources and say so plainly when they're insufficient — the
+   weakest of the three, since a prompt instruction can be ignored, which is
+   exactly why (1) and (2) don't depend on the model cooperating.
+
+`confidence` is model-self-reported, not independently calibrated — worth
+being honest about in the UI copy, not just in this doc.
+
+**Context limits** (why 8 sources, not more): Claude's actual context window
+is large enough that more sources wouldn't overflow it — the real cost is
+relevance dilution (a well-known RAG failure mode where marginal sources
+distract the model instead of it just saying "that's all I have"), per-call
+cost, and latency. History is capped at the last 10 messages (5 turns) for
+the same reason. There is deliberately no query-rewriting/condensation step —
+each turn retrieves fresh using that turn's raw question text; multi-turn
+coherence relies on the model having prior turns in-prompt, not on smarter
+retrieval. A follow-up like "why did we choose that?" works because the
+model sees the prior turn, not because retrieval understood "that" refers to
+the previous answer.
+
+**Knowledge actions never execute from the chat path.** A `suggestedAction`
+is a label + payload the assistant proposes in its JSON response; nothing
+reaches the database until `POST /api/assistant/actions/confirm` is called,
+which only happens from an explicit button click in the UI. Three of the
+four action types write to existing models with no new schema: `CREATE_PROJECT`
+→ the existing `Project` model directly; `CREATE_TASK` and `CREATE_DECISION`
+→ `ExtractedTask`/`Decision`, anchored to a `savedItemId` the user (or the
+suggested payload) specifies, with `confidence: 1` since it's user-confirmed,
+not AI-inferred; `ADD_REMINDER` → also `ExtractedTask`, using its existing
+`dueDate` field, since a reminder is structurally just a task with a
+deadline and this phase's schema section didn't ask for a dedicated
+`Reminder` model.
+
+**Data privacy, named explicitly:** retrieval and conversations are
+`userId`-scoped throughout, same as everywhere else in the app. This phase
+sends more of a user's saved content to Anthropic per call than Phase 2 did
+(several sources' text, not one item) — same vendor, same trust boundary
+already established by Phase 2, but a larger slice per request, worth
+naming rather than treating as a non-event. Conversations and messages are
+stored in plaintext in our own Postgres, consistent with `SavedItem.content`
+— no new encryption is introduced here, and none existed before.
+
 ## Risks
 
 1. **AI cost/latency** — `analyze()` is one call per item, but there's no retry/backoff yet on transient upstream failures (a timeout just fails the job; the user has to manually re-trigger `/process`).
@@ -289,6 +402,10 @@ existing item once).
 8. **No embeddings for items saved before Phase 4** — see "No backfill" above.
 9. **Known dependency risk:** Next.js 14.2.x (latest patched release on that line) still carries two open high-severity advisories fixed only in the Next.js 16 major (SSRF via rewrites, internal Server Function disclosure — both require rewrites/Server Actions usage this app doesn't have yet). Tracked for a deliberate upgrade once the Next 16 line stabilizes.
 10. **Deployment note:** `CREATE EXTENSION vector` needs a Postgres role with sufficient privilege. The docker-compose Postgres role already has it (it's that container's own superuser); a managed/restricted Postgres (some cloud providers) may need a DBA to run it once before migrations.
+11. **Hand-rolled index migrations are fragile against Prisma's drift detection.** This bit us for real during Phase 5: a routine `prisma migrate dev` for the new `Conversation`/`Message` tables auto-generated a `DROP INDEX` on the hand-written HNSW index, because Prisma's diff engine has no schema-level knowledge that the index is supposed to exist. Caught before push by inspecting the generated migration, fixed by stripping the drop and adding a restore migration — but every future schema change touching this database needs the same manual review, indefinitely, until Prisma's DSL supports vector index operator classes natively.
+12. **No query-rewriting for follow-up questions** — see "Context limits" above. A genuinely ambiguous follow-up ("what about the other one?") may retrieve poorly since retrieval doesn't benefit from conversation context, only the model's answer does.
+13. **`confidence` is model-self-reported**, not an independently computed or calibrated score — treat it as the model's own hedge, not a statistical guarantee.
+14. **Assistant-turn cost is the highest per-call cost in the app so far**: one embedding call (the question) plus one Claude call with several sources' worth of text in the prompt, per message. Still cheap in absolute terms at personal-app volume, but the most expensive single interaction available in the product.
 
 ## Implementation plan
 
@@ -296,5 +413,5 @@ existing item once).
 - **Phase 2 (done):** `AIProvider`/`ClaudeProvider`, `ProcessingJob`/`ExtractedTask`/`ExtractedEntity`/`Decision`/`Question` tables, synchronous processing pipeline triggered via `POST /api/items/:id/process`, unit tests for response parsing/validation/empty-content/duplicate-tags/entity-extraction. No UI for any of this yet, by design — backend first.
 - **Phase 3 (done):** `StorageProvider`/`LocalStorageProvider`, `TranscriptionProvider`/Whisper adapter, `AudioAttachment` table, `POST /api/audio/upload` + `POST /api/items/:id/transcribe` (auto-triggers the Phase 2 pipeline on success). Tests for successful/failed transcription, missing audio, and one live-DB-guarded pipeline-integration test. Still no UI — no recording/upload widget yet.
 - **Phase 4 (done):** `EmbeddingProvider`/OpenAI adapter, `Embedding` table (pgvector, HNSW index), automatic indexing on processing completion, `GET /api/search` with type/project/tag/date filters, `GET /api/items/:id/related`, global search bar + `/search` results page + related-items section on the item detail page. Tests for text-building, embedding success/failure, empty queries, and one live-DB-guarded test proving real cosine-similarity ranking with a deterministic fake embedding.
-- **Phase 5:** Chat UI over saved items using Phase 4 retrieval + Claude, with citations.
-- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, and arguably `/search`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting.
+- **Phase 5 (done):** `AssistantProvider`/Claude adapter, `Conversation`/`Message` tables, retrieval-augmented chat (`POST /api/assistant/messages`, `GET /api/assistant/conversations[/:id]`) with source-index validation against fabricated citations, `POST /api/assistant/actions/confirm` for user-confirmed knowledge actions (create task/decision/project, add reminder), a `/chat` page with conversation history, source/related-item cards, confidence, and confirm buttons. Tests for schema parsing, provider dispatch/failure per mode, source-index validation, and one live-DB-guarded test covering retrieval accuracy, missing-information short-circuiting, hallucination prevention, source attribution, and multi-turn conversation history.
+- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer.
