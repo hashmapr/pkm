@@ -3,16 +3,20 @@
 // (ExtractedTask, ExtractedEntity, Decision, Question).
 // Phase 3: voice capture — AudioAttachment feeds SavedItem.content, then reuses
 // the Phase 2 pipeline unchanged.
-// RelatedItem, Embedding, ChatSession/ChatMessage are planned for Phases 2(follow-up)/4/5
+// Phase 4: semantic search — Embedding (pgvector) indexed automatically when
+// AI processing completes.
+// RelatedItem, ChatSession/ChatMessage are planned for Phase 2(follow-up)/5
 // — see ARCHITECTURE.md — and are added as their own migrations when those phases start.
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
 }
 
 enum SavedItemType {
@@ -54,6 +58,14 @@ enum QuestionStatus {
   OPEN
   ANSWERED
   DISMISSED
+}
+
+enum EmbeddingEntityType {
+  SAVED_ITEM
+  EXTRACTED_TASK
+  DECISION
+  QUESTION
+  ENTITY
 }
 
 model User {
@@ -115,6 +127,25 @@ model AudioAttachment {
   savedItem SavedItem @relation(fields: [savedItemId], references: [id], onDelete: Cascade)
 
   @@map("audio_attachments")
+}
+
+// Polymorphic across SavedItem/ExtractedTask/Decision/Question/ExtractedEntity
+// (entityType + entityId) rather than five separate embedding tables. No FK on
+// entityId — it can't point at one table across five possible parents. All
+// reads/writes go through raw SQL (see src/lib/services/embedding-index.ts);
+// Prisma Client can't query an Unsupported column. The HNSW index on `vector`
+// is added in a follow-up migration — Prisma's schema DSL can't express a
+// vector index's operator class.
+model Embedding {
+  id         String              @id @default(cuid())
+  entityType EmbeddingEntityType
+  entityId   String
+  vector     Unsupported("vector(1536)")
+  model      String
+  createdAt  DateTime            @default(now())
+
+  @@unique([entityType, entityId])
+  @@map("embeddings")
 }
 
 model ProcessingJob {

@@ -4,6 +4,9 @@ import { getAIProvider } from '@/lib/ai';
 import { AIProviderError, AIResponseValidationError } from '@/lib/ai/errors';
 import type { AIExtractionResult } from '@/lib/ai/extraction';
 import type { AIProvider, SavedItemForAnalysis } from '@/lib/ai/types';
+import { getEmbeddingProvider } from '@/lib/embeddings';
+import type { EmbeddingProvider } from '@/lib/embeddings/types';
+import { indexSavedItemEmbeddings } from './embedding-index';
 import { upsertTagsByName } from './tags';
 
 export class SavedItemNotFoundError extends Error {
@@ -126,6 +129,7 @@ async function persistExtractionResult(
 export async function runProcessingJob(
   jobId: string,
   provider: AIProvider = getAIProvider(),
+  embeddingProvider: EmbeddingProvider = getEmbeddingProvider(),
 ): Promise<ProcessingJob> {
   const job = await db.processingJob.findUnique({
     where: { id: jobId },
@@ -156,10 +160,21 @@ export async function runProcessingJob(
 
   await persistExtractionResult(savedItem.userId, savedItem.id, outcome.data);
 
-  return db.processingJob.update({
+  const completedJob = await db.processingJob.update({
     where: { id: jobId },
     data: { status: 'COMPLETED', completedAt: new Date() },
   });
+
+  // Search indexing is supplementary — a failure here means this item is
+  // temporarily unsearchable, not that the processing job should be marked
+  // FAILED after already succeeding.
+  try {
+    await indexSavedItemEmbeddings(savedItem.userId, savedItem.id, embeddingProvider);
+  } catch {
+    // swallowed intentionally; see comment above
+  }
+
+  return completedJob;
 }
 
 async function failJob(jobId: string, savedItemId: string, error: string): Promise<ProcessingJob> {
@@ -178,10 +193,11 @@ export async function processSavedItem(
   userId: string,
   savedItemId: string,
   provider: AIProvider = getAIProvider(),
+  embeddingProvider: EmbeddingProvider = getEmbeddingProvider(),
 ): Promise<ProcessingJob> {
   const item = await db.savedItem.findFirst({ where: { id: savedItemId, userId } });
   if (!item) throw new SavedItemNotFoundError(savedItemId);
 
   const job = await db.processingJob.create({ data: { savedItemId, status: 'PENDING' } });
-  return runProcessingJob(job.id, provider);
+  return runProcessingJob(job.id, provider, embeddingProvider);
 }

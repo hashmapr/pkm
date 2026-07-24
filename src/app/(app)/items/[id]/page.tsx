@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { getSessionUserId } from '@/lib/auth/session';
 import { getSavedItem } from '@/lib/services/saved-items';
+import { findRelatedItems } from '@/lib/services/search';
 import { SAVED_ITEM_TYPE_LABELS } from '@/types/saved-item';
 import { DeleteItemButton } from '@/components/saved-items/delete-item-button';
 
@@ -15,6 +16,8 @@ export default async function ItemDetailPage({ params }: ItemDetailPageProps) {
 
   const item = await getSavedItem(userId, params.id);
   if (!item) notFound();
+
+  const relatedItems = await findRelatedItems(userId, params.id);
 
   return (
     <div className="max-w-2xl">
@@ -82,6 +85,29 @@ export default async function ItemDetailPage({ params }: ItemDetailPageProps) {
               #{tag.name}
             </span>
           ))}
+        </div>
+      )}
+
+      {relatedItems.length > 0 && (
+        <div className="mt-8">
+          <h2 className="text-sm font-medium text-gray-500 dark:text-neutral-400">Related items</h2>
+          <div className="mt-2 space-y-2">
+            {relatedItems.map((related) => (
+              <Link
+                key={related.id}
+                href={`/items/${related.id}`}
+                className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2 text-sm hover:border-gray-300 dark:border-neutral-800 dark:hover:border-neutral-700"
+              >
+                <span>
+                  <span className="mr-2 rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600 dark:bg-neutral-800 dark:text-neutral-300">
+                    {SAVED_ITEM_TYPE_LABELS[related.type]}
+                  </span>
+                  {related.title}
+                </span>
+                <span className="text-xs text-gray-400">{Math.round(related.similarity * 100)}% similar</span>
+              </Link>
+            ))}
+          </div>
         </div>
       )}
     </div>

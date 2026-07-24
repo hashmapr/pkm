@@ -15,6 +15,8 @@ structured, searchable **Saved Item**.
 | AI | Provider abstraction in `src/lib/ai/` (Phase 2) | `AIProvider` interface + `ClaudeProvider` adapter; swapping models means writing one adapter, not touching call sites. |
 | File storage | Storage abstraction in `src/lib/storage/` (Phase 3) | `StorageProvider` interface + `LocalStorageProvider`; local disk in dev, swaps to S3/R2 behind the same interface. |
 | Transcription | Provider abstraction in `src/lib/transcription/` (Phase 3) | `TranscriptionProvider` interface + Whisper adapter — deliberately separate from `AIProvider` since it's a different capability from a different vendor. |
+| Embeddings | Provider abstraction in `src/lib/embeddings/` (Phase 4) | `EmbeddingProvider` interface + OpenAI (`text-embedding-3-small`) adapter — its own abstraction, same reasoning as Transcription vs. AI. |
+| Vector search | pgvector (Phase 4) | Same Postgres instance as everything else; `Unsupported("vector(1536)")` column + raw SQL for similarity queries, HNSW index for cosine distance. |
 
 **Layering rule:** route handlers stay thin (parse request → call a service in
 `src/lib/services` → return response). All business logic lives in services so
@@ -22,8 +24,9 @@ UI, API, and future background jobs can all call the same code path.
 
 ## Database schema
 
-Phase 1 + Phase 2 + Phase 3 are migrated today; the rest is the planned shape
-for later phases so schema changes stay additive, not restructuring.
+Phase 1 + Phase 2 + Phase 3 + Phase 4 are migrated today; the rest is the
+planned shape for later phases so schema changes stay additive, not
+restructuring.
 
 ```
 User             id, email, passwordHash, name, createdAt
@@ -62,11 +65,19 @@ AudioAttachment  id, savedItemId (unique, 1:1), fileUrl, duration (seconds),
                  — reuses ProcessingStatus for transcriptionStatus: same
                    PENDING→PROCESSING→COMPLETED/FAILED state machine, different step
 
+-- Phase 4: semantic search --
+Embedding        id, entityType (SAVED_ITEM|EXTRACTED_TASK|DECISION|QUESTION|ENTITY),
+                 entityId, vector(1536), model, createdAt
+                 @@unique([entityType, entityId])
+                 — polymorphic across 5 entity types instead of 5 tables; all
+                   reads/writes go through raw SQL (Prisma Client can't query
+                   an Unsupported column). HNSW index on vector, added as a
+                   follow-up migration since Prisma's schema DSL has no
+                   operator-class syntax for vector indexes.
+
 -- Planned, not yet migrated --
-RelatedItem      (Phase 2 follow-up) itemId, relatedItemId, score, relationType —
-                 needs a candidate-set query strategy; AIProvider.findRelationships()
-                 exists today but isn't wired to storage yet
-Embedding        (Phase 4) savedItemId, chunkIndex, chunkText, vector(1536)
+RelatedItem      superseded — see "Related Items" below; embedding similarity
+                 answers this without a persisted graph or an LLM call
 ChatSession /
 ChatMessage      (Phase 5) userId, role, content, citations (jsonb)
 ```
@@ -104,9 +115,11 @@ src/
 │   ├── auth/{password.ts, session.ts}
 │   ├── services/            — business logic
 │   │   ├── saved-items.ts, tags.ts, projects.ts
-│   │   ├── processing.ts    — Phase 2 pipeline (job creation + execution)
-│   │   └── audio.ts         — Phase 3: upload + transcription, triggers processing.ts
-│   ├── validation/          — zod schemas (auth, saved-item)
+│   │   ├── processing.ts        — Phase 2 pipeline (job creation + execution)
+│   │   ├── audio.ts             — Phase 3: upload + transcription, triggers processing.ts
+│   │   ├── embedding-index.ts   — Phase 4: text-building + upsert/cleanup, called from processing.ts
+│   │   └── search.ts            — Phase 4: search + related-items queries
+│   ├── validation/          — zod schemas (auth, saved-item, search)
 │   ├── ai/                  — Phase 2: AIProvider abstraction
 │   │   ├── types.ts         — AIProvider interface
 │   │   ├── extraction.ts    — zod schemas + strict-JSON response parsing
@@ -116,10 +129,12 @@ src/
 │   │   └── index.ts         — getAIProvider() factory (the swap point)
 │   ├── storage/             — Phase 3: StorageProvider abstraction
 │   │   ├── types.ts, errors.ts, local-provider.ts, index.ts
-│   └── transcription/       — Phase 3: TranscriptionProvider abstraction
-│       ├── types.ts, errors.ts, whisper-provider.ts, index.ts
+│   ├── transcription/       — Phase 3: TranscriptionProvider abstraction
+│   │   ├── types.ts, errors.ts, whisper-provider.ts, index.ts
+│   └── embeddings/          — Phase 4: EmbeddingProvider abstraction
+│       ├── types.ts, errors.ts, openai-provider.ts, index.ts
 ├── middleware.ts             — route protection
-└── types/saved-item.ts
+└── types/{saved-item.ts, search.ts}
 ```
 
 ## Processing pipeline (Phase 2)
@@ -204,21 +219,82 @@ beyond the specified upload/delete/getUrl — transcription needs the raw bytes
 back, and no other method provides them. Same judgment call as Phase 2's
 `analyze()`: an interface gap that's structurally necessary, not scope creep.
 
+## Semantic search (Phase 4)
+
+```
+ProcessingJob → COMPLETED   (Phase 2's existing success path — no new trigger)
+        ↓
+  indexSavedItemEmbeddings(userId, savedItemId)
+        ↓
+  batch-embed SavedItem + its extracted tasks/decisions/questions/entities
+  (one EmbeddingProvider.generateEmbeddings call, not one per object)
+        ↓
+  upsert SAVED_ITEM embedding (stable id → ON CONFLICT)
+  garbage-collect orphaned embeddings (extracted rows get new ids every
+  reprocess; DELETE ... WHERE NOT EXISTS against each parent table)
+        ↓
+  insert fresh embeddings for the current tasks/decisions/questions/entities
+```
+
+Wrapped in try/catch in `runProcessingJob`: an indexing failure never fails
+the processing job — extraction succeeded, so the item is fully usable, just
+temporarily unsearchable.
+
+```
+GET /api/search?q=...&type=&project=&tag=&from=&to=
+        ↓
+  guard: blank q → {items:[], relatedObjects:[]}, no embedding call spent
+        ↓
+  EmbeddingProvider.generateEmbedding(q) → query vector
+        ↓
+  primary: cosine similarity over SAVED_ITEM embeddings, userId + filters
+           scoped, ORDER BY vector <=> query
+  secondary: cosine similarity over TASK/DECISION/QUESTION/ENTITY embeddings
+             (userId-scoped, no filters) → "related objects"
+```
+
+**"Highlighted relevant sections"** is the item's `summary` (or a leading
+slice of `content`), not a semantically-located excerpt — there's one
+embedding per entity here, not per chunk, so there's no sub-document span to
+point at. True passage highlighting needs chunk-level embeddings, a bigger
+schema change not made speculatively in this phase.
+
+**Related Items** (`GET /api/items/:id/related`, and the item detail page's
+"Related items" section) reuses the same embeddings with **no new API call**:
+it runs the SAVED_ITEM similarity query using the item's *own* already-stored
+vector as the query, filtered to similarity > 0.5 (a tunable heuristic) so a
+small personal knowledge base doesn't surface noise as "related." This is also
+the concrete answer to the `AIProvider.findRelationships()` gap flagged as
+unwired back in Phase 2 — an LLM call per comparison would be slow and
+expensive; embedding similarity gives the same "what's related" signal
+instantly and for free (no embedding call, since the vectors already exist).
+`findRelationships()` stays on `AIProvider` for a future higher-precision use
+but nothing calls it.
+
+**No backfill for pre-Phase-4 items:** `SavedItem`s from before this phase
+have no embeddings until they're next (re)processed. Not written in this
+phase since it wasn't asked for and is easy to add later (call
+`processSavedItem` — or just `indexSavedItemEmbeddings` directly — over every
+existing item once).
+
 ## Risks
 
 1. **AI cost/latency** — `analyze()` is one call per item, but there's no retry/backoff yet on transient upstream failures (a timeout just fails the job; the user has to manually re-trigger `/process`).
-2. **pgvector at scale** — fine for personal-scale data; needs an HNSW index if this grows large.
-3. **Entity resolution / duplicate detection**: `ExtractedEntity` rows aren't deduplicated across items yet (e.g. "LangGraph" saved from two different items are two separate rows). Fine for now since nothing consumes them cross-item; matters once `RelatedItem` linking is built.
-4. **Sync-only processing today** — `/api/items/:id/process` and `/api/items/:id/transcribe` both block on the full round-trip (Claude, and now Whisper too). Acceptable for a personal tool triggering one item at a time; not acceptable multi-user or bulk-triggered without the queue migration described in Phase 2.
+2. **pgvector at scale** — HNSW index is in place now; fine well past personal-app scale before it needs tuning (index build parameters, etc.).
+3. **Entity resolution / duplicate detection**: `ExtractedEntity` rows aren't deduplicated across items yet (e.g. "LangGraph" saved from two different items are two separate rows, and two separate embeddings). Fine for now since nothing forces them to merge; matters if a future feature wants one canonical "LangGraph" node.
+4. **Sync-only processing today** — `/api/items/:id/process`, `/api/items/:id/transcribe`, and now `/api/search` all block on a round-trip (Claude/Whisper/OpenAI embeddings respectively). Search is a single embedding call, much faster than the other two, but still synchronous. Acceptable for a personal tool used by one person at a time; not acceptable multi-user or high-traffic without the queue migration described in Phase 2.
 5. **File uploads**: `/api/audio/upload` validates mime type (`audio/*`) and a 25MB size cap (matching Whisper's real limit) — boundary validation now actually implemented, not just a flagged risk.
 6. **Original mime type isn't persisted**: `AudioAttachment` has no mime-type column (kept to the given field list), so transcription/serving guess it from the storage key's file extension. Works for common audio formats; an unusual upload with a misleading or missing extension could guess wrong.
-7. **Known dependency risk:** Next.js 14.2.x (latest patched release on that line) still carries two open high-severity advisories fixed only in the Next.js 16 major (SSRF via rewrites, internal Server Function disclosure — both require rewrites/Server Actions usage this app doesn't have yet). Tracked for a deliberate upgrade once the Next 16 line stabilizes.
+7. **Search cost is per-query, not just per-save**: every `/api/search` call spends one embedding API call on the query text. Cheap per-call, but unlike the rest of the app (which only costs money when you save something), searching costs money every time you search. Not a real concern at `text-embedding-3-small` pricing, but worth knowing.
+8. **No embeddings for items saved before Phase 4** — see "No backfill" above.
+9. **Known dependency risk:** Next.js 14.2.x (latest patched release on that line) still carries two open high-severity advisories fixed only in the Next.js 16 major (SSRF via rewrites, internal Server Function disclosure — both require rewrites/Server Actions usage this app doesn't have yet). Tracked for a deliberate upgrade once the Next 16 line stabilizes.
+10. **Deployment note:** `CREATE EXTENSION vector` needs a Postgres role with sufficient privilege. The docker-compose Postgres role already has it (it's that container's own superuser); a managed/restricted Postgres (some cloud providers) may need a DBA to run it once before migrations.
 
 ## Implementation plan
 
 - **Phase 1 (done):** Next.js scaffold, Postgres, Prisma schema (User/SavedItem/Tag/Project + joins/Attachment), auth, full CRUD for saved items with manual tags/projects, inbox + detail/edit UI.
 - **Phase 2 (done):** `AIProvider`/`ClaudeProvider`, `ProcessingJob`/`ExtractedTask`/`ExtractedEntity`/`Decision`/`Question` tables, synchronous processing pipeline triggered via `POST /api/items/:id/process`, unit tests for response parsing/validation/empty-content/duplicate-tags/entity-extraction. No UI for any of this yet, by design — backend first.
 - **Phase 3 (done):** `StorageProvider`/`LocalStorageProvider`, `TranscriptionProvider`/Whisper adapter, `AudioAttachment` table, `POST /api/audio/upload` + `POST /api/items/:id/transcribe` (auto-triggers the Phase 2 pipeline on success). Tests for successful/failed transcription, missing audio, and one live-DB-guarded pipeline-integration test. Still no UI — no recording/upload widget yet.
-- **Phase 4:** `Embedding` table + pgvector, chunking/embedding on save, semantic search.
+- **Phase 4 (done):** `EmbeddingProvider`/OpenAI adapter, `Embedding` table (pgvector, HNSW index), automatic indexing on processing completion, `GET /api/search` with type/project/tag/date filters, `GET /api/items/:id/related`, global search bar + `/search` results page + related-items section on the item detail page. Tests for text-building, embedding success/failure, empty queries, and one live-DB-guarded test proving real cosine-similarity ranking with a deterministic fake embedding.
 - **Phase 5:** Chat UI over saved items using Phase 4 retrieval + Claude, with citations.
-- **Follow-up:** `RelatedItem` table + wiring `findRelationships()` into the pipeline; background queue worker (see migration path above, now applies to `/process` and `/transcribe` both); UI to surface Phase 2/3's extracted tasks/entities/decisions/questions/audio playback + recording.
+- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, and arguably `/search`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting.

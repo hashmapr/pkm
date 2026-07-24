@@ -5,6 +5,7 @@ import type { StorageProvider } from '@/lib/storage/types';
 import type { TranscriptionProvider } from '@/lib/transcription/types';
 import type { AIProvider } from '@/lib/ai/types';
 import type { AIExtractionResult } from '@/lib/ai/extraction';
+import type { EmbeddingProvider } from '@/lib/embeddings/types';
 
 /**
  * True end-to-end coverage of "transcription -> content update -> existing
@@ -62,6 +63,13 @@ const fakeAIProvider: AIProvider = {
   analyze: async () => fakeAIResult,
 };
 
+const fakeEmbeddingProvider: EmbeddingProvider = {
+  model: 'fake-embedding-model',
+  dimensions: 1536,
+  generateEmbedding: async () => new Array(1536).fill(0),
+  generateEmbeddings: async (texts) => texts.map(() => new Array(1536).fill(0)),
+};
+
 describe.skipIf(!dbAvailable)('audio pipeline integration', () => {
   let userId: string;
 
@@ -99,6 +107,7 @@ describe.skipIf(!dbAvailable)('audio pipeline integration', () => {
       transcriptionProvider,
       storage,
       fakeAIProvider,
+      fakeEmbeddingProvider,
     );
 
     expect(audioAttachment.transcriptionStatus).toBe('COMPLETED');
@@ -133,7 +142,14 @@ describe.skipIf(!dbAvailable)('audio pipeline integration', () => {
       storage,
     );
 
-    const audioAttachment = await transcribeSavedItemAudio(userId, item.id, failingProvider, storage, fakeAIProvider);
+    const audioAttachment = await transcribeSavedItemAudio(
+      userId,
+      item.id,
+      failingProvider,
+      storage,
+      fakeAIProvider,
+      fakeEmbeddingProvider,
+    );
 
     expect(audioAttachment.transcriptionStatus).toBe('FAILED');
     expect(audioAttachment.transcript).toBeNull();

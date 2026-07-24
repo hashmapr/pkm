@@ -6,6 +6,7 @@ import { getTranscriptionProvider } from '@/lib/transcription';
 import { TranscriptionProviderError } from '@/lib/transcription/errors';
 import type { TranscriptionInput, TranscriptionProvider, TranscriptionResult } from '@/lib/transcription/types';
 import type { AIProvider } from '@/lib/ai/types';
+import type { EmbeddingProvider } from '@/lib/embeddings/types';
 import { createSavedItem, SavedItemWithRelations } from './saved-items';
 import { processSavedItem, SavedItemNotFoundError } from './processing';
 
@@ -140,6 +141,7 @@ export async function transcribeSavedItemAudio(
   transcriptionProvider: TranscriptionProvider = getTranscriptionProvider(),
   storage: StorageProvider = getStorageProvider(),
   aiProvider?: AIProvider,
+  embeddingProvider?: EmbeddingProvider,
 ): Promise<AudioAttachment> {
   const item = await db.savedItem.findFirst({
     where: { id: savedItemId, userId },
@@ -177,7 +179,7 @@ export async function transcribeSavedItemAudio(
   });
 
   await db.savedItem.update({ where: { id: savedItemId }, data: { content: outcome.data.text } });
-  await (aiProvider ? processSavedItem(userId, savedItemId, aiProvider) : processSavedItem(userId, savedItemId));
+  await processSavedItem(userId, savedItemId, aiProvider, embeddingProvider);
 
   return audioAttachment;
 }
