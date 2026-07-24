@@ -9,7 +9,11 @@ export type SavedItemType =
   | 'IMAGE'
   | 'NOTE';
 
-export type SavedItemStatus = 'NEW' | 'PROCESSING' | 'PROCESSED' | 'FAILED';
+export type ProcessingStatus = 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+
+export type EntityType = 'PERSON' | 'COMPANY' | 'TECHNOLOGY' | 'PROJECT' | 'BOOK' | 'URL' | 'CONCEPT';
+export type TaskPriority = 'LOW' | 'MEDIUM' | 'HIGH';
+export type QuestionStatus = 'OPEN' | 'ANSWERED' | 'DISMISSED';
 
 export interface SavedItemTagDto {
   tag: { id: string; name: string };
@@ -19,6 +23,44 @@ export interface SavedItemProjectDto {
   project: { id: string; name: string };
 }
 
+export interface ExtractedTaskDto {
+  id: string;
+  title: string;
+  description: string | null;
+  priority: TaskPriority;
+  dueDate: string | null;
+  confidence: number;
+}
+
+export interface ExtractedEntityDto {
+  id: string;
+  name: string;
+  type: EntityType;
+  confidence: number;
+}
+
+export interface DecisionDto {
+  id: string;
+  statement: string;
+  reasoning: string | null;
+  confidence: number;
+}
+
+export interface QuestionDto {
+  id: string;
+  question: string;
+  status: QuestionStatus;
+}
+
+export interface ProcessingJobDto {
+  id: string;
+  status: ProcessingStatus;
+  error: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
 export interface SavedItemDto {
   id: string;
   type: SavedItemType;
@@ -26,11 +68,17 @@ export interface SavedItemDto {
   source: string | null;
   content: string | null;
   summary: string | null;
-  status: SavedItemStatus;
+  keyPoints: string[];
+  status: ProcessingStatus;
   createdAt: string;
   updatedAt: string;
   tags: SavedItemTagDto[];
   projects: SavedItemProjectDto[];
+  extractedTasks: ExtractedTaskDto[];
+  extractedEntities: ExtractedEntityDto[];
+  decisions: DecisionDto[];
+  questions: QuestionDto[];
+  processingJobs: ProcessingJobDto[];
 }
 
 export const SAVED_ITEM_TYPES: SavedItemType[] = [

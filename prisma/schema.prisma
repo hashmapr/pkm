@@ -1,7 +1,8 @@
-// Phase 1 schema: auth + saved items + manual organization (tags/projects) + attachments.
-// AIExtraction, Entity, RelatedItem, Embedding, ChatSession/ChatMessage are planned
-// for Phases 2, 2, 4 and 5 respectively — see ARCHITECTURE.md — and are added as
-// their own migrations when those phases start, not scaffolded empty here.
+// Phase 1: auth + saved items + manual organization (tags/projects) + attachments.
+// Phase 2: AI processing pipeline — ProcessingJob + extracted knowledge
+// (ExtractedTask, ExtractedEntity, Decision, Question).
+// RelatedItem, Embedding, ChatSession/ChatMessage are planned for Phases 2(follow-up)/4/5
+// — see ARCHITECTURE.md — and are added as their own migrations when those phases start.
 
 generator client {
   provider = "prisma-client-js"
@@ -24,11 +25,33 @@ enum SavedItemType {
   NOTE
 }
 
-enum SavedItemStatus {
-  NEW
+enum ProcessingStatus {
+  PENDING
   PROCESSING
-  PROCESSED
+  COMPLETED
   FAILED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum EntityType {
+  PERSON
+  COMPANY
+  TECHNOLOGY
+  PROJECT
+  BOOK
+  URL
+  CONCEPT
+}
+
+enum QuestionStatus {
+  OPEN
+  ANSWERED
+  DISMISSED
 }
 
 model User {
@@ -47,26 +70,107 @@ model User {
 }
 
 model SavedItem {
-  id        String          @id @default(cuid())
+  id        String           @id @default(cuid())
   userId    String
   type      SavedItemType
   title     String
   source    String? // URL, file path, or null for freeform notes
   content   String? // raw or extracted text content
   summary   String?
-  status    SavedItemStatus @default(NEW)
+  keyPoints String[] // AI-extracted key points (Phase 2)
+  status    ProcessingStatus @default(PENDING)
   metadata  Json? // type-specific raw fields (e.g. github stars, video duration)
-  createdAt DateTime        @default(now())
-  updatedAt DateTime        @updatedAt
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
 
   user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   tags        SavedItemTag[]
   projects    SavedItemProject[]
   attachments Attachment[]
 
+  processingJobs    ProcessingJob[]
+  extractedTasks    ExtractedTask[]
+  extractedEntities ExtractedEntity[]
+  decisions         Decision[]
+  questions         Question[]
+
   @@index([userId, createdAt])
   @@index([userId, type])
   @@map("saved_items")
+}
+
+model ProcessingJob {
+  id          String           @id @default(cuid())
+  savedItemId String
+  status      ProcessingStatus @default(PENDING)
+  error       String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime         @default(now())
+
+  savedItem SavedItem @relation(fields: [savedItemId], references: [id], onDelete: Cascade)
+
+  @@index([savedItemId, createdAt])
+  @@index([status])
+  @@map("processing_jobs")
+}
+
+model ExtractedTask {
+  id          String       @id @default(cuid())
+  savedItemId String
+  title       String
+  description String?
+  priority    TaskPriority @default(MEDIUM)
+  dueDate     DateTime?
+  confidence  Float
+  createdAt   DateTime     @default(now())
+
+  savedItem SavedItem @relation(fields: [savedItemId], references: [id], onDelete: Cascade)
+
+  @@index([savedItemId])
+  @@map("extracted_tasks")
+}
+
+model ExtractedEntity {
+  id          String     @id @default(cuid())
+  savedItemId String
+  name        String
+  type        EntityType
+  confidence  Float
+  createdAt   DateTime   @default(now())
+
+  savedItem SavedItem @relation(fields: [savedItemId], references: [id], onDelete: Cascade)
+
+  @@index([savedItemId])
+  @@index([name, type])
+  @@map("extracted_entities")
+}
+
+model Decision {
+  id          String   @id @default(cuid())
+  savedItemId String
+  statement   String
+  reasoning   String?
+  confidence  Float
+  createdAt   DateTime @default(now())
+
+  savedItem SavedItem @relation(fields: [savedItemId], references: [id], onDelete: Cascade)
+
+  @@index([savedItemId])
+  @@map("decisions")
+}
+
+model Question {
+  id          String         @id @default(cuid())
+  savedItemId String
+  question    String
+  status      QuestionStatus @default(OPEN)
+  createdAt   DateTime       @default(now())
+
+  savedItem SavedItem @relation(fields: [savedItemId], references: [id], onDelete: Cascade)
+
+  @@index([savedItemId])
+  @@map("questions")
 }
 
 model Attachment {

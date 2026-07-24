@@ -2,11 +2,17 @@ import { Prisma, SavedItemType } from '@prisma/client';
 import { db } from '@/lib/db';
 import { upsertTagsByName } from './tags';
 import { upsertProjectsByName } from './projects';
+import { createProcessingJobForItem } from './processing';
 
 const savedItemInclude = {
   tags: { include: { tag: true } },
   projects: { include: { project: true } },
   attachments: true,
+  extractedTasks: true,
+  extractedEntities: true,
+  decisions: true,
+  questions: true,
+  processingJobs: { orderBy: { createdAt: 'desc' }, take: 1 },
 } satisfies Prisma.SavedItemInclude;
 
 export type SavedItemWithRelations = Prisma.SavedItemGetPayload<{ include: typeof savedItemInclude }>;
@@ -70,7 +76,7 @@ export async function createSavedItem(userId: string, input: SavedItemInput) {
     upsertProjectsByName(userId, input.projects ?? []),
   ]);
 
-  return db.savedItem.create({
+  const item = await db.savedItem.create({
     data: {
       userId,
       type: input.type,
@@ -82,6 +88,9 @@ export async function createSavedItem(userId: string, input: SavedItemInput) {
     },
     include: savedItemInclude,
   });
+
+  await createProcessingJobForItem(item.id);
+  return item;
 }
 
 export async function updateSavedItem(userId: string, id: string, input: Partial<SavedItemInput>) {
@@ -111,7 +120,9 @@ export async function updateSavedItem(userId: string, id: string, input: Partial
     };
   }
 
-  return db.savedItem.update({ where: { id }, data, include: savedItemInclude });
+  const item = await db.savedItem.update({ where: { id }, data, include: savedItemInclude });
+  await createProcessingJobForItem(item.id);
+  return { ...item, status: 'PENDING' as const };
 }
 
 export async function deleteSavedItem(userId: string, id: string) {

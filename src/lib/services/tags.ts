@@ -8,9 +8,14 @@ export async function listTags(userId: string) {
   });
 }
 
+/** Trims, lowercases, drops empties, and de-duplicates a list of tag names. */
+export function normalizeTagNames(names: string[]): string[] {
+  return Array.from(new Set(names.map((n) => n.trim().toLowerCase()).filter(Boolean)));
+}
+
 /** Finds-or-creates tags by name for a user. Returns tag ids. */
 export async function upsertTagsByName(userId: string, names: string[]): Promise<string[]> {
-  const unique = Array.from(new Set(names.map((n) => n.trim().toLowerCase()).filter(Boolean)));
+  const unique = normalizeTagNames(names);
   if (unique.length === 0) return [];
 
   const tags = await Promise.all(
