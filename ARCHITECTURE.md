@@ -723,6 +723,76 @@ logic is covered instead by a DB-guarded integration test using the same
 deterministic hashed fake-embedding technique `search.integration.test.ts`
 established, run for real against this environment's live Postgres.
 
+## Albo-inspired layer, Sub-Phase E (UI pass)
+
+No new schema, no new services — this sub-phase gives Sub-Phases A-D's
+backend-only work (capture, collections, rediscovery, suggestions) an
+actual UI. Before this, `POST /api/capture`, `GET /api/rediscovery`, and
+`GET /api/collections/suggested` were only reachable via `curl`.
+
+**Universal capture entry point** — a new `/capture` page
+(`src/components/capture/capture-form.tsx`), reachable from a `+ Capture`
+button in the header on every page (not tied to any one page's context,
+matching the "universal" framing). One textarea for a link or freeform
+text, auto-detected client-side (`new URL(...)` parses and the protocol is
+http/https → sent as `url`; otherwise sent as `text` — the API itself
+already requires exactly one or the other, so the client picks instead of
+asking the user to). A separate file input covers image/screenshot/PDF
+uploads, with a checkbox that only appears for image files and sets
+`hint: 'screenshot'` in the `multipart/form-data` request when checked —
+mirrors `CaptureInput.hint`'s reasoning from Sub-Phase C exactly (the
+checkbox is the caller-supplied signal pixels alone can't provide). This
+is deliberately a full page, not a modal — no dialog/overlay primitive
+exists anywhere in this codebase yet, and building one (focus trap,
+escape-to-close, overlay) for a single use would be disproportionate to
+this sub-phase; a future modal-based quick-capture is a reasonable next
+UI polish, not a requirement.
+
+This is a second, parallel entry point alongside Phase 1's `/items/new`
+manual form — deliberately left in place. `/items/new` is explicit-type,
+no auto-detection, no `CaptureProvider` dispatch; `/capture` is "paste
+anything, let it figure out the type." Different jobs, both still useful.
+
+**Saved-item cards** (`src/components/saved-items/item-card.tsx`, used on
+`/inbox`) now show an importance-score badge next to the type badge, a
+one-line truncated `saveReason` (styled the same amber as the item detail
+page's fuller callout), and collection chips alongside the existing
+project/tag chips — all conditionally rendered, so items without these
+fields (most of Phase 1-3's original data) look exactly as before.
+`SavedItemDto` gained `importanceScore`, `saveReason`, and `collections`
+fields to carry this data through; the underlying query
+(`listSavedItems`'s `savedItemInclude`) already selected all three since
+Sub-Phase A, so this was a type/rendering change only, no service change.
+
+**`/rediscover` page** renders `getRediscoveryDigest`'s three sections
+(suggested collections first, then related discoveries, forgotten items,
+recently saved — most-actionable-first ordering) plus
+`suggestCollections`'s candidates, each with an
+`AcceptSuggestedCollectionButton` client component that calls `POST
+/api/collections/suggested/accept` and refreshes the page — nothing is
+created just by the page rendering. A new `Rediscover` nav link joins the
+header alongside the existing Inbox/Search/Projects/Collections/Assistant
+links.
+
+**Verified in a real browser, not just `curl`** — Playwright wasn't
+preinstalled as a project dependency, but a global install was available
+in this environment; a throwaway driver script (not committed — this
+sub-phase didn't reach the point of needing a reusable one, unlike the
+`run` skill's guidance for projects that will need repeated UI iteration)
+drove a real headless Chromium against a running dev server: registered
+an account, filled the `/capture` textarea with plain text, submitted, and
+landed on the new item's real detail page; separately, selected a real PDF
+file in the same form and confirmed it landed as a `PDF`-typed item with
+actual extracted text. Also manually set `importanceScore`/`saveReason`
+and added a collection to a captured item via a direct DB script, then
+confirmed the inbox card rendered all three new elements (badge, save-
+reason line, collection chip) correctly. `/rediscover` was confirmed to
+render its four sections' correct empty states with no captured items
+having embeddings yet (same real-embedding limitation as Sub-Phase D —
+unverified in this sandbox is the *populated* rediscovery/suggestion
+rendering, not the page's structure or empty-state handling, both of
+which were exercised for real).
+
 ## Risks
 
 1. **AI cost/latency** — `analyze()` is one call per item, but there's no retry/backoff yet on transient upstream failures (a timeout just fails the job; the user has to manually re-trigger `/process`).
@@ -751,6 +821,9 @@ established, run for real against this environment's live Postgres.
 24. **`suggestCollections`'s pairwise-similarity query is O(n²) in the candidate pool size** (currently capped at 50 recent uncollected items) — fine at that size, would need a smarter approach (e.g. ANN search instead of an exhaustive self-join) if the pool size were ever raised significantly.
 25. **Rediscovery and suggested-collections' real-world clustering/similarity quality is unverified in this environment** — both are covered by a DB-guarded integration test using the same deterministic hashed fake-embedding technique as Phase 4's search tests (real SQL, real Postgres, fake vectors), but neither was exercised against real embeddings live, since that needs a working `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` unavailable in this sandbox — the same gap flagged for Claude vision in Sub-Phase C.
 26. **No UI surfaces any of Sub-Phase D yet** — `GET /api/rediscovery` and the suggested-collections endpoints are real and tested but there's still no page for them; that's explicitly Sub-Phase E's job.
+27. **No automated UI test coverage for Sub-Phase E** — verification was a one-off Playwright driver script run manually against a live dev server, not a checked-in e2e suite; a regression in `/capture` or `/rediscover` wouldn't be caught by `npm test`. Worth a real Playwright suite if this UI grows further.
+28. **`/capture`'s client-side URL-vs-text detection is a heuristic** (`new URL()` succeeds and the protocol is http/https), not a guarantee it matches what the server would decide — in practice it can't diverge, since the server applies the identical rule (`url` field present → treated as a URL), but a user pasting something URL-shaped-but-not-really could get a confusing "detected as a link" hint for input that isn't really one.
+29. **No modal/dialog primitive exists in this codebase** — `/capture` is a full page rather than an in-context quick-capture overlay, and confirmations still use the browser's native `confirm()` (`DeleteCollectionButton`, `DeleteItemButton`). Fine for a personal-use app; a real dialog component would be worth building before adding more confirm-heavy flows.
 
 ## Implementation plan
 
@@ -763,5 +836,6 @@ established, run for real against this environment's live Postgres.
 - **Local/self-hosted model backends (done):** `OpenAICompatibleAIProvider` and `OpenAICompatibleAssistantProvider` (new classes, `openai` SDK against a configurable `baseURL`) plus a `baseURL` option added to the existing `OpenAIEmbeddingProvider` — Ollama and NVIDIA NIM both speak the OpenAI chat-completions/embeddings dialect, so one adapter per capability covers both. Selected independently per capability via `AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER=openai-compatible` env vars, defaulting to unchanged Claude/OpenAI behavior. Tests cover request shape/error handling against a mocked SDK client and the env-var-driven factory selection logic in all three modules; no live Ollama/NIM instance was available to test against in this environment.
 - **Sub-Phase B (done):** real `WebCaptureProvider` (generic HTML page extraction via `cheerio`: title/author/description/images, ARTICLE-vs-LINK length heuristic), `YouTubeCaptureProvider` (oEmbed metadata, best-effort transcript/chapter scraping), and `GitHubCaptureProvider` (repo metadata/languages/README via the GitHub REST API, optional `GITHUB_TOKEN`), registered ahead of `NoteCaptureProvider` — no schema, route, or registry-shape changes needed beyond registering the three new providers. `/api/capture` now also catches `CaptureProviderError` generically (422 with the provider's own message). Tests mock `fetch` for all three; `WebCaptureProvider` and `YouTubeCaptureProvider` were additionally verified with live smoke tests in this environment, `GitHubCaptureProvider` was not (this sandbox's own network policy blocks direct `api.github.com` access — see Risks).
 - **Sub-Phase C (done):** `VisionProvider`/`ClaudeVisionProvider` (new abstraction, image description + OCR), `ImageCaptureProvider` and `ScreenshotCaptureProvider` (disambiguated by a caller-supplied `hint`, not pixel inference), and `PDFCaptureProvider` (pinned to `pdf-parse@1.x` after 2.x crashed under real Next.js bundling — see Risks). `POST /api/capture` now accepts `multipart/form-data` file uploads alongside its existing JSON url/text body; file-based captures get their bytes persisted as an `Attachment` (Phase 1's schema, first real writer) and served via a new `GET /api/attachments/file/[key]`. Tests mock the Claude vision client and `pdf-parse`; `PDFCaptureProvider`, `WebCaptureProvider`, and `YouTubeCaptureProvider`'s capture paths were additionally verified end-to-end with a live smoke test (a real PDF captured, parsed, and served back byte-identical); the image/screenshot vision call itself couldn't be positively verified without a real `ANTHROPIC_API_KEY`, but its failure path (422 with a clear message, no crash) was.
-- **Sub-Phase D (done):** rediscovery (`getRecentlySaved`/`getForgottenItems`/`getRelatedDiscoveries`/`getRediscoveryDigest` in `src/lib/services/rediscovery.ts`, exposed via `GET /api/rediscovery`) and AI-suggested collections (`suggestCollections`/`acceptSuggestedCollection` in `src/lib/services/collection-suggestions.ts`, exposed via `GET /api/collections/suggested` + `POST /api/collections/suggested/accept`). No schema changes — both are queries over data Sub-Phases A-C and Phase 4 already produce; clustering is a plain union-find over a pairwise-embedding-similarity self-join, and collection naming avoids adding a new `AIProvider` method by falling back to a shared-tag heuristic. Suggestions are never auto-created — same confirm-first rule as Phase 5's knowledge actions. Tests: pure unit tests for the clustering/naming logic, a DB-guarded integration test (deterministic fake embeddings, same technique as Phase 4's search tests) covering all four rediscovery/suggestion flows, and a live smoke test against a real Postgres instance for the parts not dependent on real embeddings (recently-saved ordering, forgotten-item age filtering, and the accept endpoint's collection creation). Rediscovery/suggestion behavior against *real* embeddings couldn't be verified live in this sandbox (no working `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`). Further UI polish (E — there is still no capture or rediscovery UI at all, only APIs) and a final tests+docs pass (F) are not started.
-- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer; a live end-to-end check of `GitHubCaptureProvider`, the `openai-compatible` adapters, real Claude-vision image analysis, and real-embedding rediscovery/clustering outside this sandbox; re-evaluate the `pdf-parse` 1.x pin once a newer release's Next.js-bundling compatibility is confirmed; an actual scheduled job to deliver the rediscovery digest, instead of only an on-demand endpoint.
+- **Sub-Phase D (done):** rediscovery (`getRecentlySaved`/`getForgottenItems`/`getRelatedDiscoveries`/`getRediscoveryDigest` in `src/lib/services/rediscovery.ts`, exposed via `GET /api/rediscovery`) and AI-suggested collections (`suggestCollections`/`acceptSuggestedCollection` in `src/lib/services/collection-suggestions.ts`, exposed via `GET /api/collections/suggested` + `POST /api/collections/suggested/accept`). No schema changes — both are queries over data Sub-Phases A-C and Phase 4 already produce; clustering is a plain union-find over a pairwise-embedding-similarity self-join, and collection naming avoids adding a new `AIProvider` method by falling back to a shared-tag heuristic. Suggestions are never auto-created — same confirm-first rule as Phase 5's knowledge actions. Tests: pure unit tests for the clustering/naming logic, a DB-guarded integration test (deterministic fake embeddings, same technique as Phase 4's search tests) covering all four rediscovery/suggestion flows, and a live smoke test against a real Postgres instance for the parts not dependent on real embeddings (recently-saved ordering, forgotten-item age filtering, and the accept endpoint's collection creation). Rediscovery/suggestion behavior against *real* embeddings couldn't be verified live in this sandbox (no working `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`).
+- **Sub-Phase E (done):** UI pass — a `/capture` page (universal capture entry point, client-side url-vs-text detection, file upload with a screenshot hint checkbox) reachable via a `+ Capture` header button on every page; `SavedItemCard` updated to show importance/save-reason/collections (new `SavedItemDto` fields, no service changes); a `/rediscover` page rendering the full digest plus AI-suggested collections with an accept action. No new schema or services. Verified with a real headless-Chromium Playwright session against a live dev server (text capture, PDF file-upload capture, and the new card elements all confirmed rendering correctly end-to-end) rather than just `curl` — see ARCHITECTURE.md's Sub-Phase E section for exactly what that covered vs. what still needs real embeddings to verify. A final tests+docs pass (F) is not started.
+- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer; a live end-to-end check of `GitHubCaptureProvider`, the `openai-compatible` adapters, real Claude-vision image analysis, and real-embedding rediscovery/clustering outside this sandbox; re-evaluate the `pdf-parse` 1.x pin once a newer release's Next.js-bundling compatibility is confirmed; an actual scheduled job to deliver the rediscovery digest, instead of only an on-demand endpoint; a real checked-in Playwright e2e suite instead of the one-off manual driver script used to verify Sub-Phase E; a modal/dialog primitive for in-context quick-capture.

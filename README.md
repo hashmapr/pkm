@@ -40,12 +40,17 @@ URLs from any of these sources, not just plain text.
 extraction) — `POST /api/capture` now also accepts `multipart/form-data`
 file uploads, with the raw file persisted as an `Attachment` and served back
 via `GET /api/attachments/file/[key]`.
-**Sub-Phase D (current):** rediscovery — `GET /api/rediscovery` (recently
+**Sub-Phase D (done):** rediscovery — `GET /api/rediscovery` (recently
 saved, forgotten items, and "you saved this a while ago and it connects to
 what you just saved" related discoveries) — and AI-suggested collections —
 `GET /api/collections/suggested` clusters similar recent saves by embedding
 similarity, `POST /api/collections/suggested/accept` turns a suggestion the
 user confirms into a real collection. Nothing is created automatically.
+**Sub-Phase E (current):** UI pass — a `/capture` page (the universal
+capture entry point: paste a link or text, or upload an image/screenshot/
+PDF, reachable via a `+ Capture` button in the header on every page), saved-
+item cards now show importance score/save reason/collections, and a
+`/rediscover` page for everything Sub-Phase D's endpoints compute.
 See ALBO_ANALYSIS.md and ALBO_INTEGRATION_PLAN.md for the research behind
 this and the full Sub-Phase A-F roadmap, and ARCHITECTURE.md for the full
 design.
@@ -200,7 +205,13 @@ curl -b cookies.txt -X POST http://localhost:3000/api/collections/suggested/acce
 # -> { "collection": { ..., "isAiSuggested": true } }
 ```
 
-There's no UI for either yet — API only, same as capture until Sub-Phase E.
+Or just use the `/rediscover` page, with an "Accept as collection" button
+on each suggestion.
+
+Capture anything from the UI, without touching `curl` at all: click
+**+ Capture** in the header (visible on every page) to open `/capture` —
+paste a link or write a note in the one box (detected automatically), or
+upload an image/screenshot/PDF instead.
 
 ## Testing
 

@@ -32,11 +32,20 @@ export default async function AppLayout({ children }: { children: React.ReactNod
             <Link href="/chat" className="text-gray-600 hover:text-gray-900 dark:text-neutral-400 dark:hover:text-white">
               Assistant
             </Link>
+            <Link href="/rediscover" className="text-gray-600 hover:text-gray-900 dark:text-neutral-400 dark:hover:text-white">
+              Rediscover
+            </Link>
           </nav>
           <Suspense>
             <SearchBar />
           </Suspense>
           <div className="ml-auto flex shrink-0 items-center gap-3 text-sm text-gray-600 dark:text-neutral-400">
+            <Link
+              href="/capture"
+              className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-neutral-800 dark:bg-white dark:text-neutral-900"
+            >
+              + Capture
+            </Link>
             <span>{user.name ?? user.email}</span>
             <SignOutButton />
           </div>

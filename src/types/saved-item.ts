@@ -23,6 +23,10 @@ export interface SavedItemProjectDto {
   project: { id: string; name: string };
 }
 
+export interface SavedItemCollectionDto {
+  collection: { id: string; name: string; emoji: string | null };
+}
+
 export interface ExtractedTaskDto {
   id: string;
   title: string;
@@ -72,8 +76,11 @@ export interface SavedItemDto {
   status: ProcessingStatus;
   createdAt: string;
   updatedAt: string;
+  importanceScore: number | null;
+  saveReason: string | null;
   tags: SavedItemTagDto[];
   projects: SavedItemProjectDto[];
+  collections: SavedItemCollectionDto[];
   extractedTasks: ExtractedTaskDto[];
   extractedEntities: ExtractedEntityDto[];
   decisions: DecisionDto[];
