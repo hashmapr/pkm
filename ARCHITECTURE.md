@@ -32,7 +32,11 @@ Phase 1 through Phase 5 are all migrated, plus Sub-Phase A of the
 Albo-inspired layer (see [ALBO_ANALYSIS.md](./ALBO_ANALYSIS.md) /
 [ALBO_INTEGRATION_PLAN.md](./ALBO_INTEGRATION_PLAN.md) for that layer's own
 research and design). Everything below is additive — no existing model was
-rewritten to build any of it.
+rewritten to build any of it. **This is also the final schema state** —
+Sub-Phases B through E (real capture providers, image/PDF capture,
+rediscovery/suggestions, and the UI pass) added zero new models or columns;
+everything they needed already existed, including `Attachment`, which sat
+completely unused from Phase 1 until Sub-Phase C finally gave it a writer.
 
 ```
 User             id, email, passwordHash, name, createdAt
@@ -134,9 +138,12 @@ one assistant turn and read together by the UI on every reload.
 src/
 ├── app/
 │   ├── (auth)/login, register            — public
-│   ├── (app)/inbox, items/[id], (edit), projects, search, chat/[id], layout.tsx — authenticated
-│   └── api/auth/*, items/*, tags, projects, search, audio/*, assistant/*
-├── components/{layout, saved-items, projects, search, chat}
+│   ├── (app)/inbox, items/[id], (edit), projects, search, chat/[id],
+│   │         collections, collections/[id], capture, rediscover, layout.tsx — authenticated
+│   └── api/auth/*, items/*, tags, projects, search, audio/*, assistant/*,
+│         capture, collections/*, collections/suggested/*, attachments/file/[key],
+│         rediscovery
+├── components/{layout, saved-items, projects, search, chat, collections, capture, rediscovery}
 ├── lib/
 │   ├── db.ts                — Prisma client singleton
 │   ├── auth/{password.ts, session.ts}
@@ -150,14 +157,17 @@ src/
 │   │   ├── assistant-chat.ts    — Phase 5: RAG orchestration (retrieve, guard, call, persist)
 │   │   ├── conversations.ts     — Phase 5: list/fetch conversations
 │   │   ├── knowledge-actions.ts — Phase 5: the only place a confirmed suggested action writes to the DB
-│   │   ├── collections.ts       — Albo layer: Collection CRUD, add/remove items
-│   │   └── capture.ts           — Albo layer: dispatches through CaptureProvider registry, then createSavedItem
+│   │   ├── collections.ts       — Albo layer (A): Collection CRUD, add/remove items
+│   │   ├── capture.ts           — Albo layer (A/C): dispatches through CaptureProvider registry, uploads files, then createSavedItem
+│   │   ├── rediscovery.ts       — Albo layer (D): recently-saved/forgotten/related-discovery queries
+│   │   └── collection-suggestions.ts — Albo layer (D): embedding-similarity clustering + accept
 │   ├── validation/          — zod schemas (auth, saved-item, search, assistant, collections, capture)
 │   ├── ai/                  — Phase 2: AIProvider abstraction
 │   │   ├── types.ts         — AIProvider interface
 │   │   ├── extraction.ts    — zod schemas + strict-JSON response parsing
 │   │   ├── prompts.ts       — prompt templates per capability
 │   │   ├── claude-provider.ts
+│   │   ├── openai-compatible-provider.ts — local/self-hosted backends (Ollama, NVIDIA NIM)
 │   │   ├── errors.ts        — AIProviderError, AIResponseValidationError
 │   │   └── index.ts         — getAIProvider() factory (the swap point)
 │   ├── storage/             — Phase 3: StorageProvider abstraction
@@ -165,20 +175,30 @@ src/
 │   ├── transcription/       — Phase 3: TranscriptionProvider abstraction
 │   │   ├── types.ts, errors.ts, whisper-provider.ts, index.ts
 │   ├── embeddings/          — Phase 4: EmbeddingProvider abstraction
-│   │   ├── types.ts, errors.ts, openai-provider.ts, index.ts
+│   │   ├── types.ts, errors.ts, openai-provider.ts (also serves openai-compatible backends via baseURL), index.ts
+│   ├── vision/              — Albo layer (C): VisionProvider abstraction (image description + OCR)
+│   │   ├── types.ts, errors.ts, claude-vision-provider.ts, index.ts
 │   └── assistant/           — Phase 5: AssistantProvider abstraction
 │       ├── types.ts         — AssistantProvider interface, ContextSource, SuggestedAction
 │       ├── schemas.ts       — zod schema + strict-JSON response parsing
 │       ├── prompts.ts       — prompt templates per mode (answer/summarize/compare/find-conflicts)
 │       ├── claude-assistant-provider.ts
+│       ├── openai-compatible-assistant-provider.ts — local/self-hosted backends
 │       ├── errors.ts        — AssistantProviderError, AssistantResponseValidationError
 │       └── index.ts         — getAssistantProvider() factory
-├── capture/                 — Albo layer: CaptureProvider abstraction
-│   ├── types.ts             — CaptureProvider interface (supports/capture)
+├── capture/                 — Albo layer (A/B/C): CaptureProvider abstraction
+│   ├── types.ts             — CaptureProvider interface (supports/capture), CaptureInput.hint
 │   ├── errors.ts            — NoCaptureProviderError, CaptureProviderError
 │   ├── registry.ts          — CaptureProviderRegistry (ordered, first-match dispatch)
-│   ├── providers/note-provider.ts — the only concrete provider so far (plain text fallback)
-│   └── index.ts             — getCaptureRegistry() factory
+│   ├── providers/
+│   │   ├── note-provider.ts       — (A) plain text, the fallback
+│   │   ├── web-provider.ts        — (B) generic HTML extraction via cheerio
+│   │   ├── youtube-provider.ts    — (B) oEmbed + best-effort transcript/chapters
+│   │   ├── github-provider.ts     — (B) GitHub REST API (README/languages/stars)
+│   │   ├── image-provider.ts      — (C) Claude vision, hint !== 'SCREENSHOT'
+│   │   ├── screenshot-provider.ts — (C) Claude vision, hint === 'SCREENSHOT'
+│   │   └── pdf-provider.ts        — (C) pdf-parse@1.x text/metadata extraction
+│   └── index.ts             — getCaptureRegistry() factory (registration order matters)
 ├── middleware.ts             — route protection
 └── types/{saved-item.ts, search.ts, assistant.ts}
 ```
@@ -837,5 +857,5 @@ which were exercised for real).
 - **Sub-Phase B (done):** real `WebCaptureProvider` (generic HTML page extraction via `cheerio`: title/author/description/images, ARTICLE-vs-LINK length heuristic), `YouTubeCaptureProvider` (oEmbed metadata, best-effort transcript/chapter scraping), and `GitHubCaptureProvider` (repo metadata/languages/README via the GitHub REST API, optional `GITHUB_TOKEN`), registered ahead of `NoteCaptureProvider` — no schema, route, or registry-shape changes needed beyond registering the three new providers. `/api/capture` now also catches `CaptureProviderError` generically (422 with the provider's own message). Tests mock `fetch` for all three; `WebCaptureProvider` and `YouTubeCaptureProvider` were additionally verified with live smoke tests in this environment, `GitHubCaptureProvider` was not (this sandbox's own network policy blocks direct `api.github.com` access — see Risks).
 - **Sub-Phase C (done):** `VisionProvider`/`ClaudeVisionProvider` (new abstraction, image description + OCR), `ImageCaptureProvider` and `ScreenshotCaptureProvider` (disambiguated by a caller-supplied `hint`, not pixel inference), and `PDFCaptureProvider` (pinned to `pdf-parse@1.x` after 2.x crashed under real Next.js bundling — see Risks). `POST /api/capture` now accepts `multipart/form-data` file uploads alongside its existing JSON url/text body; file-based captures get their bytes persisted as an `Attachment` (Phase 1's schema, first real writer) and served via a new `GET /api/attachments/file/[key]`. Tests mock the Claude vision client and `pdf-parse`; `PDFCaptureProvider`, `WebCaptureProvider`, and `YouTubeCaptureProvider`'s capture paths were additionally verified end-to-end with a live smoke test (a real PDF captured, parsed, and served back byte-identical); the image/screenshot vision call itself couldn't be positively verified without a real `ANTHROPIC_API_KEY`, but its failure path (422 with a clear message, no crash) was.
 - **Sub-Phase D (done):** rediscovery (`getRecentlySaved`/`getForgottenItems`/`getRelatedDiscoveries`/`getRediscoveryDigest` in `src/lib/services/rediscovery.ts`, exposed via `GET /api/rediscovery`) and AI-suggested collections (`suggestCollections`/`acceptSuggestedCollection` in `src/lib/services/collection-suggestions.ts`, exposed via `GET /api/collections/suggested` + `POST /api/collections/suggested/accept`). No schema changes — both are queries over data Sub-Phases A-C and Phase 4 already produce; clustering is a plain union-find over a pairwise-embedding-similarity self-join, and collection naming avoids adding a new `AIProvider` method by falling back to a shared-tag heuristic. Suggestions are never auto-created — same confirm-first rule as Phase 5's knowledge actions. Tests: pure unit tests for the clustering/naming logic, a DB-guarded integration test (deterministic fake embeddings, same technique as Phase 4's search tests) covering all four rediscovery/suggestion flows, and a live smoke test against a real Postgres instance for the parts not dependent on real embeddings (recently-saved ordering, forgotten-item age filtering, and the accept endpoint's collection creation). Rediscovery/suggestion behavior against *real* embeddings couldn't be verified live in this sandbox (no working `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`).
-- **Sub-Phase E (done):** UI pass — a `/capture` page (universal capture entry point, client-side url-vs-text detection, file upload with a screenshot hint checkbox) reachable via a `+ Capture` header button on every page; `SavedItemCard` updated to show importance/save-reason/collections (new `SavedItemDto` fields, no service changes); a `/rediscover` page rendering the full digest plus AI-suggested collections with an accept action. No new schema or services. Verified with a real headless-Chromium Playwright session against a live dev server (text capture, PDF file-upload capture, and the new card elements all confirmed rendering correctly end-to-end) rather than just `curl` — see ARCHITECTURE.md's Sub-Phase E section for exactly what that covered vs. what still needs real embeddings to verify. A final tests+docs pass (F) is not started.
+- **Sub-Phase E (done):** UI pass — a `/capture` page (universal capture entry point, client-side url-vs-text detection, file upload with a screenshot hint checkbox) reachable via a `+ Capture` header button on every page; `SavedItemCard` updated to show importance/save-reason/collections (new `SavedItemDto` fields, no service changes); a `/rediscover` page rendering the full digest plus AI-suggested collections with an accept action. No new schema or services. Verified with a real headless-Chromium Playwright session against a live dev server (text capture, PDF file-upload capture, and the new card elements all confirmed rendering correctly end-to-end) rather than just `curl` — see ARCHITECTURE.md's Sub-Phase E section for exactly what that covered vs. what still needs real embeddings to verify. - **Sub-Phase F (done):** final tests+docs pass, closing out the Albo-inspired layer. Added `src/lib/capture/__tests__/factory.test.ts` — the one real coverage gap found on review: every other provider abstraction in this app (`ai`, `assistant`, `embeddings`, `vision`) has a `factory.test.ts` proving its `getXProvider()` selects correctly, but `getCaptureRegistry()`'s actual registration order had only been exercised indirectly through individual provider tests, not asserted end-to-end (e.g. that a `github.com` URL really does resolve to `GitHubCaptureProvider` and not the generic `WebCaptureProvider` through the real exported registry). Rewrote CAPABILITIES.md with two new sections (universal capture, local/self-hosted models) and a fully revised "what's not built yet" list — closing the now-false "no automated content ingestion" gap from the original release and replacing it with the real gaps this layer introduced (no scheduled digest, no e2e suite, the `pdf-parse` pin, three real-service checks still outstanding). Updated ARCHITECTURE.md's folder structure and schema-section framing to reflect the finished state, and condensed README.md's per-sub-phase changelog into one summary now that the roadmap is complete.
 - **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer; a live end-to-end check of `GitHubCaptureProvider`, the `openai-compatible` adapters, real Claude-vision image analysis, and real-embedding rediscovery/clustering outside this sandbox; re-evaluate the `pdf-parse` 1.x pin once a newer release's Next.js-bundling compatibility is confirmed; an actual scheduled job to deliver the rediscovery digest, instead of only an on-demand endpoint; a real checked-in Playwright e2e suite instead of the one-off manual driver script used to verify Sub-Phase E; a modal/dialog primitive for in-context quick-capture.
