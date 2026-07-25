@@ -185,6 +185,7 @@ export interface RelatedItemResult {
   title: string;
   summary: string | null;
   similarity: number;
+  createdAt: Date;
 }
 
 /**
@@ -205,7 +206,7 @@ export async function findRelatedItems(
     WITH target AS (
       SELECT vector FROM embeddings WHERE "entityType" = 'SAVED_ITEM' AND "entityId" = ${savedItemId}
     )
-    SELECT si.id, si.type, si.title, si.summary,
+    SELECT si.id, si.type, si.title, si.summary, si."createdAt",
            1 - (e.vector <=> target.vector) AS similarity
     FROM embeddings e
     JOIN saved_items si ON si.id = e."entityId"

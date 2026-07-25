@@ -23,26 +23,23 @@ retrieval-augmented chat over your saved knowledge with source citations,
 confidence scores, and user-confirmed knowledge actions (create a task,
 save a decision, create a project, add a reminder — nothing executes without
 an explicit confirm click). `/chat` page with conversation history.
-**Sub-Phase A (done):** first slice of an Albo-inspired universal capture
-layer — `Collection`/`SavedItemCollection` for lightweight manual grouping
-alongside tags/projects, a `CaptureProvider` abstraction behind
-`POST /api/capture`, and two new AI-derived fields on each item —
-`importanceScore` and a plain-language `saveReason` ("why this was saved").
-**Sub-Phase B (done):** real capture providers — `WebCaptureProvider`
-(generic webpage extraction: title/author/description/images, classified
-as `LINK` or `ARTICLE`), `YouTubeCaptureProvider` (title/author via oEmbed,
-best-effort transcript + chapters), and `GitHubCaptureProvider` (README,
-languages, stars via the GitHub REST API) — `POST /api/capture` now handles
-URLs from any of these sources, not just plain text.
-**Sub-Phase C (current):** file-upload capture — `ImageCaptureProvider` and
-`ScreenshotCaptureProvider` (Claude vision: description + OCR, via a new
-`VisionProvider` abstraction), and `PDFCaptureProvider` (text/metadata
-extraction) — `POST /api/capture` now also accepts `multipart/form-data`
-file uploads, with the raw file persisted as an `Attachment` and served back
-via `GET /api/attachments/file/[key]`.
-See ALBO_ANALYSIS.md and ALBO_INTEGRATION_PLAN.md for the research behind
-this and the full Sub-Phase A-F roadmap, and ARCHITECTURE.md for the full
-design.
+**Albo-inspired universal capture layer (done, Sub-Phases A-F):** one
+capture entry point — `POST /api/capture` or the **+ Capture** button on
+every page — that classifies and extracts whatever you give it: a webpage,
+a YouTube video, a GitHub repo, an image/screenshot (Claude vision:
+description + OCR), a PDF, or plain text, each via its own `CaptureProvider`.
+Lightweight `Collection`s for grouping alongside tags/projects; an
+AI-estimated importance score and plain-language "why this was saved" on
+every item; a `/rediscover` page surfacing recently-saved items, forgotten
+items, related-knowledge connections, and AI-suggested collections (never
+auto-created — you confirm). Every AI capability (extraction, chat,
+embeddings) can also run against a local/self-hosted model (Ollama, NVIDIA
+NIM) instead of Claude/OpenAI, per-capability, via env vars. See
+[CAPABILITIES.md](./CAPABILITIES.md) for the full feature list,
+[ALBO_ANALYSIS.md](./ALBO_ANALYSIS.md)/[ALBO_INTEGRATION_PLAN.md](./ALBO_INTEGRATION_PLAN.md)
+for the research and sub-phase-by-sub-phase plan, and
+[ARCHITECTURE.md](./ARCHITECTURE.md) for the full design and what's still
+unverified against real live services in this development environment.
 
 ## Setup
 
@@ -176,50 +173,66 @@ curl -b cookies.txt http://localhost:3000/api/collections/<id>
 Or just use the `/collections` page, and the "Add to collection" control on
 any item's detail page.
 
+Check what's worth revisiting, and accept an AI-suggested collection:
+
+```bash
+curl -b cookies.txt http://localhost:3000/api/rediscovery
+# -> { "recentlySaved": [...], "forgottenItems": [...], "relatedDiscoveries": [...] }
+# forgottenItems: saved 14+ days ago, never viewed (or not viewed in 14+ days)
+# relatedDiscoveries: pairs where a recent save connects to older saved knowledge
+
+curl -b cookies.txt http://localhost:3000/api/collections/suggested
+# -> { "suggestions": [{ "name": "...", "itemIds": [...], "items": [...] }] }
+# candidates only — nothing is created until you accept one:
+
+curl -b cookies.txt -X POST http://localhost:3000/api/collections/suggested/accept \
+  -H "Content-Type: application/json" \
+  -d '{"name":"AI Agents","itemIds":["<id1>","<id2>"]}'
+# -> { "collection": { ..., "isAiSuggested": true } }
+```
+
+Or just use the `/rediscover` page, with an "Accept as collection" button
+on each suggestion.
+
+Capture anything from the UI, without touching `curl` at all: click
+**+ Capture** in the header (visible on every page) to open `/capture` —
+paste a link or write a note in the one box (detected automatically), or
+upload an image/screenshot/PDF instead.
+
 ## Testing
 
 ```bash
 npm test
 ```
 
-Unit tests cover AI response parsing/validation, failed-response handling,
-empty-content guarding, duplicate-tag normalization, entity extraction
-validation, local storage read/write/delete, transcription
-success/failure/missing-audio, embedding text-building and success/failure
-handling, the search service's empty-query guard and highlight logic, and
-the assistant's response parsing, per-mode provider dispatch/failure, and
-source-index validation (the hallucination-prevention mechanism), the
-`CaptureProviderRegistry`'s dispatch order/no-match behavior and
-`NoteCaptureProvider`'s title derivation, the new `importanceScore`/
-`saveReason` fields on the AI extraction schema, the
-`OpenAICompatibleAIProvider`/`OpenAICompatibleAssistantProvider` request
-shape and error handling against a mocked SDK client, the
-`AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER` factory selection
-logic (env-var-driven, defaults preserved, required-config errors), and
-`WebCaptureProvider`/`YouTubeCaptureProvider`/`GitHubCaptureProvider`'s
-extraction, classification, and error handling against a mocked `fetch`,
-`ClaudeVisionProvider`'s image-content-block request shape and error
-handling against a mocked SDK client, `ImageCaptureProvider`/
-`ScreenshotCaptureProvider`'s hint-based dispatch and content-building
-against a fake `VisionProvider`, `PDFCaptureProvider`'s text/metadata
-mapping against a mocked `pdf-parse`, and `captureItem`'s file-size
-validation and storage/`Attachment`-creation logic against a mocked
-database — all against pure functions and fake/mocked providers, no live
-database, network call, or real Ollama/NIM/GitHub-API/Claude-vision access
-required (though `WebCaptureProvider`, `YouTubeCaptureProvider`, and
-`PDFCaptureProvider`'s full capture-to-served-attachment path were
-additionally smoke-tested against real live requests; see ARCHITECTURE.md
-for what wasn't, including why `PDFCaptureProvider` is pinned to
-`pdf-parse@1.x`).
+**188 tests across 31 files.** Unit tests (no network or database access
+needed) cover: AI response parsing/validation and failure handling for
+every provider (extraction, assistant, embeddings, vision); the
+hallucination-prevention source-index check; local storage read/write/
+delete; transcription success/failure; every `CaptureProvider`'s
+supports()/capture() logic against mocked `fetch`/SDK clients/`pdf-parse`,
+plus the real exported registry's dispatch order end-to-end
+(`getCaptureRegistry()`, not just each provider in isolation);
+`AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER`'s env-var-driven
+factory selection; `captureItem`'s file-size validation and storage/
+`Attachment`-creation against a mocked database; and
+`clusterBySimilarity`/`deriveClusterName`'s AI-suggested-collection
+clustering logic as pure functions.
 
-Four tests need a real database (pgvector) and skip cleanly if none is
-reachable: `audio-pipeline.integration.test.ts` (transcribe → content update
-→ processing pipeline), `search.integration.test.ts` (real cosine-similarity
-ranking via pgvector using a deterministic hashed-text fake embedding, plus
-filter narrowing and the related-items query),
-`assistant-chat.integration.test.ts` (retrieval accuracy, missing-information
-short-circuiting, dropping a fabricated source citation, and multi-turn
-conversation history — same deterministic fake embedding, no live embedding
-or Claude call needed), and `collections.integration.test.ts` (create/list
-with item counts, idempotent add/remove, and cross-user access checks via
-`CollectionNotFoundError`).
+Six integration tests need a real database (pgvector) and skip cleanly if
+none is reachable, using deterministic fake/hashed embeddings instead of
+live API calls so the suite stays runnable offline:
+`audio-pipeline.integration.test.ts`, `search.integration.test.ts`,
+`assistant-chat.integration.test.ts`, `collections.integration.test.ts`,
+and `rediscovery.integration.test.ts` (recently-saved ordering,
+forgotten-item age filtering, related-discovery pairing, and
+suggested-collection clustering/acceptance).
+
+Beyond the automated suite, a subset of capture providers (web page
+fetching, YouTube, real PDF parsing end-to-end through a served-back
+attachment) and the `/capture`/`/rediscover` UI were additionally verified
+against real live requests/a real browser during development — see
+ARCHITECTURE.md for exactly what was and wasn't (GitHub capture, real
+Claude-vision calls, and local-model inference all remain unverified
+against the real live service in this environment, for reasons unrelated
+to the app itself).
