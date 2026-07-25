@@ -34,12 +34,18 @@ as `LINK` or `ARTICLE`), `YouTubeCaptureProvider` (title/author via oEmbed,
 best-effort transcript + chapters), and `GitHubCaptureProvider` (README,
 languages, stars via the GitHub REST API) — `POST /api/capture` now handles
 URLs from any of these sources, not just plain text.
-**Sub-Phase C (current):** file-upload capture — `ImageCaptureProvider` and
+**Sub-Phase C (done):** file-upload capture — `ImageCaptureProvider` and
 `ScreenshotCaptureProvider` (Claude vision: description + OCR, via a new
 `VisionProvider` abstraction), and `PDFCaptureProvider` (text/metadata
 extraction) — `POST /api/capture` now also accepts `multipart/form-data`
 file uploads, with the raw file persisted as an `Attachment` and served back
 via `GET /api/attachments/file/[key]`.
+**Sub-Phase D (current):** rediscovery — `GET /api/rediscovery` (recently
+saved, forgotten items, and "you saved this a while ago and it connects to
+what you just saved" related discoveries) — and AI-suggested collections —
+`GET /api/collections/suggested` clusters similar recent saves by embedding
+similarity, `POST /api/collections/suggested/accept` turns a suggestion the
+user confirms into a real collection. Nothing is created automatically.
 See ALBO_ANALYSIS.md and ALBO_INTEGRATION_PLAN.md for the research behind
 this and the full Sub-Phase A-F roadmap, and ARCHITECTURE.md for the full
 design.
@@ -176,6 +182,26 @@ curl -b cookies.txt http://localhost:3000/api/collections/<id>
 Or just use the `/collections` page, and the "Add to collection" control on
 any item's detail page.
 
+Check what's worth revisiting, and accept an AI-suggested collection:
+
+```bash
+curl -b cookies.txt http://localhost:3000/api/rediscovery
+# -> { "recentlySaved": [...], "forgottenItems": [...], "relatedDiscoveries": [...] }
+# forgottenItems: saved 14+ days ago, never viewed (or not viewed in 14+ days)
+# relatedDiscoveries: pairs where a recent save connects to older saved knowledge
+
+curl -b cookies.txt http://localhost:3000/api/collections/suggested
+# -> { "suggestions": [{ "name": "...", "itemIds": [...], "items": [...] }] }
+# candidates only — nothing is created until you accept one:
+
+curl -b cookies.txt -X POST http://localhost:3000/api/collections/suggested/accept \
+  -H "Content-Type: application/json" \
+  -d '{"name":"AI Agents","itemIds":["<id1>","<id2>"]}'
+# -> { "collection": { ..., "isAiSuggested": true } }
+```
+
+There's no UI for either yet — API only, same as capture until Sub-Phase E.
+
 ## Testing
 
 ```bash
@@ -210,9 +236,10 @@ required (though `WebCaptureProvider`, `YouTubeCaptureProvider`, and
 `PDFCaptureProvider`'s full capture-to-served-attachment path were
 additionally smoke-tested against real live requests; see ARCHITECTURE.md
 for what wasn't, including why `PDFCaptureProvider` is pinned to
-`pdf-parse@1.x`).
+`pdf-parse@1.x`), plus `clusterBySimilarity`'s union-find grouping and
+`deriveClusterName`'s shared-tag-majority heuristic as pure functions.
 
-Four tests need a real database (pgvector) and skip cleanly if none is
+Five tests need a real database (pgvector) and skip cleanly if none is
 reachable: `audio-pipeline.integration.test.ts` (transcribe → content update
 → processing pipeline), `search.integration.test.ts` (real cosine-similarity
 ranking via pgvector using a deterministic hashed-text fake embedding, plus
@@ -220,6 +247,9 @@ filter narrowing and the related-items query),
 `assistant-chat.integration.test.ts` (retrieval accuracy, missing-information
 short-circuiting, dropping a fabricated source citation, and multi-turn
 conversation history — same deterministic fake embedding, no live embedding
-or Claude call needed), and `collections.integration.test.ts` (create/list
+or Claude call needed), `collections.integration.test.ts` (create/list
 with item counts, idempotent add/remove, and cross-user access checks via
-`CollectionNotFoundError`).
+`CollectionNotFoundError`), and `rediscovery.integration.test.ts` (recently-
+saved ordering, forgotten-item age filtering, related-discovery pairing, and
+suggested-collection clustering/acceptance — same deterministic fake
+embedding as the search tests).

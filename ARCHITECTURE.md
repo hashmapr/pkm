@@ -656,6 +656,73 @@ stored column, so serving is exact. A 25MB cap (`MAX_CAPTURE_FILE_BYTES`,
 matching Whisper's real limit reused as a sane generic default) is enforced
 before any provider or storage call, in `captureItem()` itself.
 
+## Albo-inspired layer, Sub-Phase D (rediscovery + AI-suggested collections)
+
+Two new services, no schema changes — everything here is a query over data
+Sub-Phases A-C (and Phase 4) already produce.
+
+**`src/lib/services/rediscovery.ts`** — `getRecentlySaved`, `getForgottenItems`,
+`getRelatedDiscoveries`, and `getRediscoveryDigest` (the three combined).
+`getForgottenItems` surfaces items older than 14 days that are either
+never-viewed or last-viewed more than 14 days ago, ordered by
+`lastViewedAt` ascending with nulls first (never-viewed items are the most
+neglected, shown first) — a straightforward query against
+`SavedItem.createdAt`/`lastViewedAt` (the latter added in Sub-Phase A
+specifically for this). `getRelatedDiscoveries` is the "you saved this a
+while ago — it connects to what you just saved" feature: it takes the 5
+most recently saved items as anchors and calls Phase 4's existing
+`findRelatedItems` for each, keeping only the results old enough (same
+14-day bar) to count as pre-existing knowledge rather than another brand-new
+save. **No new similarity mechanism, no persisted relationship table** — this
+reuses the exact embedding-similarity query the item detail page's "Related
+items" section already runs, just triggered proactively over a batch of
+recent items instead of requiring the user to open one item's page first.
+`findRelatedItems`'s `RelatedItemResult` gained a `createdAt` field
+(backward-compatible addition) so this age filter has something to check.
+
+**`GET /api/rediscovery`** is the "weekly-digest-shaped query" flagged in
+`ALBO_INTEGRATION_PLAN.md` — there's no job scheduler anywhere in this app
+(a known gap since Phase 2), so this is an on-demand endpoint standing in
+for what a scheduled digest would compute, not an actual cron job.
+
+**`src/lib/services/collection-suggestions.ts`** — `suggestCollections`
+fetches the user's most recent items that aren't already in any collection,
+computes pairwise cosine similarity between their stored embeddings (one
+raw SQL self-join, not N calls to `findRelatedItems`), and clusters them
+with a plain union-find (`clusterBySimilarity`, pure and unit-tested) over
+pairs above a 0.6 similarity bar — deliberately higher than
+`findRelatedItems`'s 0.5 "loosely related" bar, since proposing a whole
+collection is a stronger claim than a related-items link. Clusters below 2
+members are dropped. **Naming avoids a new AI-provider method entirely**:
+`deriveClusterName` looks for a tag shared by more than half the cluster's
+members and title-cases it; if none exists, the caller falls back to a
+generic "`N` related saves" name the user can rename before accepting. This
+keeps the "AI" in "AI-suggested collections" to the embedding-similarity
+clustering itself rather than adding an LLM call (and the dual-adapter
+Claude/`openai-compatible` maintenance burden that would come with adding a
+method to `AIProvider`) just to generate a label.
+
+**Suggestions are never auto-created.** `GET /api/collections/suggested`
+returns candidates only; `POST /api/collections/suggested/accept` is the
+only thing that calls `createCollection`/`addItemToCollection` — same "AI
+suggests, user confirms" rule as Phase 5's knowledge actions. Accepted
+collections are marked `isAiSuggested: true` (the flag Sub-Phase A's schema
+already reserved for exactly this).
+
+Verified live against a real Postgres instance in this environment: capture
+two similar notes, confirm `GET /api/rediscovery`'s `recentlySaved` lists
+them, backdate one via direct DB update to simulate age, confirm
+`forgottenItems` picks it up correctly, and confirm `POST
+/api/collections/suggested/accept` creates and populates a real
+`isAiSuggested` collection. **`suggestCollections`/`getRelatedDiscoveries`'s
+actual clustering/similarity behavior against real embeddings couldn't be
+exercised live** — that needs processed items with real embeddings, which
+needs a working `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`, unavailable in this
+sandbox (same limitation noted for Claude vision in Sub-Phase C) — so that
+logic is covered instead by a DB-guarded integration test using the same
+deterministic hashed fake-embedding technique `search.integration.test.ts`
+established, run for real against this environment's live Postgres.
+
 ## Risks
 
 1. **AI cost/latency** — `analyze()` is one call per item, but there's no retry/backoff yet on transient upstream failures (a timeout just fails the job; the user has to manually re-trigger `/process`).
@@ -681,6 +748,9 @@ before any provider or storage call, in `captureItem()` itself.
 21. **`pdf-parse` is pinned to the 1.x line, deliberately behind latest** — the 2.x line crashes when bundled into a Next.js server route (see "Sub-Phase C" above); revisit the pin only after confirming a specific 2.x+ release actually works under real webpack bundling, not just in isolated Node scripts.
 22. **Image/screenshot capture cost is the second-highest per-call cost in the app** (after assistant turns) — one Claude vision call per capture, in addition to the existing `analyze()` call every saved item gets during processing. Two Claude calls per image captured, not one.
 23. **Screenshot-vs-image is a caller-supplied hint, easily gotten wrong** — nothing validates that a caller claiming `hint: 'screenshot'` actually uploaded a screenshot; worst case is a slightly-mismatched prompt emphasis (asking "what app is this" of an actual photo), not a broken capture.
+24. **`suggestCollections`'s pairwise-similarity query is O(n²) in the candidate pool size** (currently capped at 50 recent uncollected items) — fine at that size, would need a smarter approach (e.g. ANN search instead of an exhaustive self-join) if the pool size were ever raised significantly.
+25. **Rediscovery and suggested-collections' real-world clustering/similarity quality is unverified in this environment** — both are covered by a DB-guarded integration test using the same deterministic hashed fake-embedding technique as Phase 4's search tests (real SQL, real Postgres, fake vectors), but neither was exercised against real embeddings live, since that needs a working `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` unavailable in this sandbox — the same gap flagged for Claude vision in Sub-Phase C.
+26. **No UI surfaces any of Sub-Phase D yet** — `GET /api/rediscovery` and the suggested-collections endpoints are real and tested but there's still no page for them; that's explicitly Sub-Phase E's job.
 
 ## Implementation plan
 
@@ -692,5 +762,6 @@ before any provider or storage call, in `captureItem()` itself.
 - **Sub-Phase A (done):** Albo-inspired universal capture layer, first slice. `Collection`/`SavedItemCollection` schema plus additive `SavedItem` fields (`metadata`, `importanceScore`, `saveReason`, `lastViewedAt`); `CaptureProvider`/`CaptureProviderRegistry`/`NoteCaptureProvider` abstraction and `POST /api/capture`; Collections CRUD (`/api/collections[/:id][/items[/:savedItemId]]`) plus a `/collections` list/detail UI and an "Add to collection" control on the item detail page; `analyze()`'s schema extended with `importanceScore`/`saveReason` (non-clobbering on reprocess); `markSavedItemViewed` wired into the item detail page. Tests for registry dispatch/`NoteCaptureProvider` behavior, the new AI-response fields, and one live-DB-guarded collections-integration test. See `ALBO_ANALYSIS.md` and `ALBO_INTEGRATION_PLAN.md` for the research and full Sub-Phase A-F roadmap.
 - **Local/self-hosted model backends (done):** `OpenAICompatibleAIProvider` and `OpenAICompatibleAssistantProvider` (new classes, `openai` SDK against a configurable `baseURL`) plus a `baseURL` option added to the existing `OpenAIEmbeddingProvider` — Ollama and NVIDIA NIM both speak the OpenAI chat-completions/embeddings dialect, so one adapter per capability covers both. Selected independently per capability via `AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER=openai-compatible` env vars, defaulting to unchanged Claude/OpenAI behavior. Tests cover request shape/error handling against a mocked SDK client and the env-var-driven factory selection logic in all three modules; no live Ollama/NIM instance was available to test against in this environment.
 - **Sub-Phase B (done):** real `WebCaptureProvider` (generic HTML page extraction via `cheerio`: title/author/description/images, ARTICLE-vs-LINK length heuristic), `YouTubeCaptureProvider` (oEmbed metadata, best-effort transcript/chapter scraping), and `GitHubCaptureProvider` (repo metadata/languages/README via the GitHub REST API, optional `GITHUB_TOKEN`), registered ahead of `NoteCaptureProvider` — no schema, route, or registry-shape changes needed beyond registering the three new providers. `/api/capture` now also catches `CaptureProviderError` generically (422 with the provider's own message). Tests mock `fetch` for all three; `WebCaptureProvider` and `YouTubeCaptureProvider` were additionally verified with live smoke tests in this environment, `GitHubCaptureProvider` was not (this sandbox's own network policy blocks direct `api.github.com` access — see Risks).
-- **Sub-Phase C (done):** `VisionProvider`/`ClaudeVisionProvider` (new abstraction, image description + OCR), `ImageCaptureProvider` and `ScreenshotCaptureProvider` (disambiguated by a caller-supplied `hint`, not pixel inference), and `PDFCaptureProvider` (pinned to `pdf-parse@1.x` after 2.x crashed under real Next.js bundling — see Risks). `POST /api/capture` now accepts `multipart/form-data` file uploads alongside its existing JSON url/text body; file-based captures get their bytes persisted as an `Attachment` (Phase 1's schema, first real writer) and served via a new `GET /api/attachments/file/[key]`. Tests mock the Claude vision client and `pdf-parse`; `PDFCaptureProvider`, `WebCaptureProvider`, and `YouTubeCaptureProvider`'s capture paths were additionally verified end-to-end with a live smoke test (a real PDF captured, parsed, and served back byte-identical); the image/screenshot vision call itself couldn't be positively verified without a real `ANTHROPIC_API_KEY`, but its failure path (422 with a clear message, no crash) was. Rediscovery (D), further UI polish (E — there is still no capture UI at all, only the API), and a final tests+docs pass (F) are not started.
-- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer; a live end-to-end check of `GitHubCaptureProvider`, the `openai-compatible` adapters, and real Claude-vision image analysis outside this sandbox; re-evaluate the `pdf-parse` 1.x pin once a newer release's Next.js-bundling compatibility is confirmed.
+- **Sub-Phase C (done):** `VisionProvider`/`ClaudeVisionProvider` (new abstraction, image description + OCR), `ImageCaptureProvider` and `ScreenshotCaptureProvider` (disambiguated by a caller-supplied `hint`, not pixel inference), and `PDFCaptureProvider` (pinned to `pdf-parse@1.x` after 2.x crashed under real Next.js bundling — see Risks). `POST /api/capture` now accepts `multipart/form-data` file uploads alongside its existing JSON url/text body; file-based captures get their bytes persisted as an `Attachment` (Phase 1's schema, first real writer) and served via a new `GET /api/attachments/file/[key]`. Tests mock the Claude vision client and `pdf-parse`; `PDFCaptureProvider`, `WebCaptureProvider`, and `YouTubeCaptureProvider`'s capture paths were additionally verified end-to-end with a live smoke test (a real PDF captured, parsed, and served back byte-identical); the image/screenshot vision call itself couldn't be positively verified without a real `ANTHROPIC_API_KEY`, but its failure path (422 with a clear message, no crash) was.
+- **Sub-Phase D (done):** rediscovery (`getRecentlySaved`/`getForgottenItems`/`getRelatedDiscoveries`/`getRediscoveryDigest` in `src/lib/services/rediscovery.ts`, exposed via `GET /api/rediscovery`) and AI-suggested collections (`suggestCollections`/`acceptSuggestedCollection` in `src/lib/services/collection-suggestions.ts`, exposed via `GET /api/collections/suggested` + `POST /api/collections/suggested/accept`). No schema changes — both are queries over data Sub-Phases A-C and Phase 4 already produce; clustering is a plain union-find over a pairwise-embedding-similarity self-join, and collection naming avoids adding a new `AIProvider` method by falling back to a shared-tag heuristic. Suggestions are never auto-created — same confirm-first rule as Phase 5's knowledge actions. Tests: pure unit tests for the clustering/naming logic, a DB-guarded integration test (deterministic fake embeddings, same technique as Phase 4's search tests) covering all four rediscovery/suggestion flows, and a live smoke test against a real Postgres instance for the parts not dependent on real embeddings (recently-saved ordering, forgotten-item age filtering, and the accept endpoint's collection creation). Rediscovery/suggestion behavior against *real* embeddings couldn't be verified live in this sandbox (no working `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`). Further UI polish (E — there is still no capture or rediscovery UI at all, only APIs) and a final tests+docs pass (F) are not started.
+- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer; a live end-to-end check of `GitHubCaptureProvider`, the `openai-compatible` adapters, real Claude-vision image analysis, and real-embedding rediscovery/clustering outside this sandbox; re-evaluate the `pdf-parse` 1.x pin once a newer release's Next.js-bundling compatibility is confirmed; an actual scheduled job to deliver the rediscovery digest, instead of only an on-demand endpoint.

@@ -9,3 +9,9 @@ export const createCollectionSchema = z.object({
 export const addItemToCollectionSchema = z.object({
   savedItemId: z.string().min(1),
 });
+
+export const acceptSuggestedCollectionSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  emoji: z.string().trim().max(8).optional(),
+  itemIds: z.array(z.string().min(1)).min(1).max(200),
+});
