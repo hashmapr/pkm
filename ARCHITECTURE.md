@@ -18,7 +18,8 @@ structured, searchable **Saved Item**.
 | Embeddings | Provider abstraction in `src/lib/embeddings/` (Phase 4) | `EmbeddingProvider` interface + OpenAI (`text-embedding-3-small`) adapter — its own abstraction, same reasoning as Transcription vs. AI. |
 | Vector search | pgvector (Phase 4) | Same Postgres instance as everything else; `Unsupported("vector(1536)")` column + raw SQL for similarity queries, HNSW index for cosine distance. |
 | AI assistant | Provider abstraction in `src/lib/assistant/` (Phase 5) | `AssistantProvider` interface + Claude adapter — its own abstraction (not new `AIProvider` methods), same reasoning as Transcription/Embeddings: different capability, independently swappable, even though currently the same vendor. |
-| Universal capture | Provider abstraction in `src/lib/capture/` (Albo layer, Sub-Phase A) | `CaptureProvider` interface (`supports`/`capture`) + a registry, so adding a new source type (web, YouTube, GitHub, PDF, image) means writing one provider and registering it — no call-site changes to `POST /api/capture`. |
+| Universal capture | Provider abstraction in `src/lib/capture/` (Albo layer, Sub-Phase A/B) | `CaptureProvider` interface (`supports`/`capture`) + a registry, so adding a new source type (web, YouTube, GitHub, PDF, image) means writing one provider and registering it — no call-site changes to `POST /api/capture`. |
+| Local/self-hosted models | `OpenAICompatibleAIProvider` / `OpenAICompatibleAssistantProvider` / `OpenAIEmbeddingProvider`'s `baseURL` option | Ollama and NVIDIA NIM both speak the OpenAI chat-completions and embeddings request shape, so one adapter per capability covers both vendors instead of two — selected per-capability via `AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER` env vars, defaulting to Claude/OpenAI unchanged. |
 
 **Layering rule:** route handlers stay thin (parse request → call a service in
 `src/lib/services` → return response). All business logic lives in services so
@@ -411,19 +412,67 @@ naming rather than treating as a non-event. Conversations and messages are
 stored in plaintext in our own Postgres, consistent with `SavedItem.content`
 — no new encryption is introduced here, and none existed before.
 
+## Local / self-hosted model backends (Ollama, NVIDIA NIM)
+
+`AIProvider`, `AssistantProvider`, and `EmbeddingProvider` can each be pointed
+independently at a local/self-hosted backend instead of Claude/OpenAI, via
+`AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER=openai-compatible` (see
+`.env.example`). This isn't three new adapters: Ollama's `/v1` compatibility
+endpoint and NVIDIA NIM's endpoints both speak the same request/response shape
+as OpenAI's chat-completions and embeddings APIs, so one
+`OpenAICompatible*Provider` class per capability, configured with a
+`baseURL` (`OPENAI_COMPATIBLE_BASE_URL`) and model name
+(`OPENAI_COMPATIBLE_MODEL` / `OPENAI_COMPATIBLE_EMBEDDING_MODEL`), covers
+both vendors. `src/lib/ai/openai-compatible-provider.ts` and
+`src/lib/assistant/openai-compatible-assistant-provider.ts` are new classes
+using the `openai` npm SDK's chat-completions call (the Claude adapters use
+the Anthropic SDK's Messages API, a different enough shape that they couldn't
+share a class); `EmbeddingProvider` didn't need a new class at all — it
+already used the `openai` SDK, so a `baseURL` constructor option was enough.
+
+Each switch defaults to unchanged behavior (Claude for AI/Assistant, OpenAI
+for embeddings) — existing deployments need no config changes.
+
+**The `dimensions` request parameter is OpenAI-specific** (only
+`text-embedding-3-*` honor it) and most OpenAI-compatible local servers
+reject an unrecognized field, so `OpenAIEmbeddingProvider` only sends it when
+`baseURL` is unset (real OpenAI).
+
+**Embedding-dimension mismatch is the one real migration cost of switching
+embeddings.** `embeddings.vector` is a fixed-width `vector(1536)` column
+(sized for OpenAI's `text-embedding-3-small`). A local embedding model with a
+different output width — e.g. Ollama's `nomic-embed-text` at 768 dimensions —
+needs the column resized to match before it'll accept inserts:
+`ALTER TABLE embeddings ALTER COLUMN vector TYPE vector(768);` (adjust the
+HNSW index rebuild per the recurring hand-rolled-index-migration hazard
+below), and every already-indexed item needs re-embedding — there's no
+automatic backfill or dimension-conversion path. Set
+`OPENAI_COMPATIBLE_EMBEDDING_DIMENSIONS` to match whatever the migration set.
+
+**Transcription (Whisper, Phase 3) has no local/NIM adapter yet.** Neither
+Ollama nor NIM's chat/embedding NIMs do speech-to-text; NIM does offer
+separate ASR NIMs (Parakeet/Canary) but with a different API shape than
+OpenAI's `/v1/audio/transcriptions`, so `TranscriptionProvider` still
+requires `OPENAI_API_KEY` regardless of these switches. A local Whisper-API-
+compatible server (e.g. `faster-whisper`/`speaches`) could work today by
+pointing `TranscriptionProvider`'s existing OpenAI client at a custom
+`baseURL` the same way, but that adapter hasn't been built.
+
 ## Albo-inspired layer, Sub-Phase A (universal capture + collections)
 
 Research and full design in [ALBO_ANALYSIS.md](./ALBO_ANALYSIS.md) and
 [ALBO_INTEGRATION_PLAN.md](./ALBO_INTEGRATION_PLAN.md) — this section covers
-what's actually built so far (Sub-Phase A of that plan; B-F are follow-up
-work).
+what's actually built so far (Sub-Phase A of that plan; C-F are follow-up
+work). Sub-Phase B (real Web/YouTube/GitHub capture providers) is covered in
+its own section below.
 
 ```
 POST /api/capture  { url? | text?, title?, tags?, projects? }
         ↓
   CaptureProviderRegistry.capture(input) — first registered provider whose
-  supports() matches; today that's only NoteCaptureProvider (plain text,
-  no url, no file) — URL dispatch (Web/YouTube/GitHub) lands in Sub-Phase B
+  supports() matches, tried in registration order: YouTubeCaptureProvider →
+  GitHubCaptureProvider → WebCaptureProvider → NoteCaptureProvider (fallback,
+  plain text with no url and no file)
         ↓
   createSavedItem() — the exact same function manual creation already uses;
   same tag/project handling, same automatic ProcessingJob queuing
@@ -465,6 +514,79 @@ future `prisma migrate dev` touching this schema needs the same manual
 review of the generated SQL before applying it. Fixed the same way: strip
 the erroneous drop, add a small restore migration.
 
+## Albo-inspired layer, Sub-Phase B (real Web/YouTube/GitHub capture)
+
+Three concrete `CaptureProvider`s, registered in `src/lib/capture/index.ts`
+in this order (first match wins): `YouTubeCaptureProvider` →
+`GitHubCaptureProvider` → `WebCaptureProvider` → `NoteCaptureProvider`. No
+schema, API route, or registry changes were needed — this is exactly the
+"write one provider, register it" extension point Sub-Phase A built.
+
+**`WebCaptureProvider`** is the generic fallback for any input with a URL
+that neither of the more specific providers claims. It fetches the page
+(10s timeout, a real `User-Agent` since some sites block the default Node
+one), rejects non-HTML content types (PDF/image links are Sub-Phase C's
+job, not this provider's), and extracts title (`og:title` → `<title>`),
+author, description, `og:site_name`, and up to 5 image URLs via `cheerio` —
+no dependency on `@mozilla/readability` or a headless browser; `cheerio`'s
+already-lightweight DOM parsing was enough for this level of extraction.
+Main content is taken from `<article>` → `<main>` → `<body>` after
+stripping `script`/`style`/`nav`/`header`/`footer`/`aside`, capped at 40,000
+characters. **Classification (`LINK` vs `ARTICLE`) is a length heuristic**
+(≥600 extracted characters → `ARTICLE`), decided after fetching, since
+`WebCaptureProvider.type` is nominally `LINK` but `capture()`'s actual
+output can be either — nothing else in the codebase treats `provider.type`
+as a contract on what `capture()` returns.
+
+**`YouTubeCaptureProvider`** gets title/author/thumbnail from YouTube's
+public, unauthenticated oEmbed endpoint (`youtube.com/oembed?url=...`) —
+that part is a real, documented API and a hard failure (any non-2xx) fails
+the whole capture, since without it there's no metadata worth saving.
+Transcript and description, by contrast, are **best-effort scraping**: the
+watch page's HTML is fetched, `captionTracks` is regex-extracted out of the
+embedded player-response JSON blob, and the first (preferring English)
+track's `baseUrl` is fetched and stripped of XML tags for plain transcript
+text; the description meta tag is parsed for chapter-looking lines
+(`0:00 Intro` style) as a lightweight chapters list. **There is no
+supported public API for either of these** — the real YouTube Data API's
+`captions.download` requires OAuth as the video's own owner, so this is the
+same unofficial approach most "youtube-transcript" npm packages use, and it
+can silently degrade to `transcriptAvailable: false` (not throw) if YouTube
+changes its markup or a video has no captions. Confirmed via a live smoke
+test against a real video in this environment: oEmbed metadata capture
+succeeded, but the transcript step returned no `captionTracks` match for
+that particular fetch — the graceful degradation path is exercised for
+real, not just in mocked tests, though transcript extraction itself
+couldn't be positively confirmed working end-to-end here.
+
+**`GitHubCaptureProvider`** matches any `github.com/{owner}/{repo}...` URL,
+then calls three real GitHub REST endpoints — `GET /repos/{owner}/{repo}`
+(hard failure on 404/non-2xx, mirroring YouTube's oEmbed-is-required
+approach), `GET .../languages`, and `GET .../readme` (`Accept:
+application/vnd.github.raw+json` for plain text instead of base64) — the
+latter two are best-effort: a failure falls back to the repo's
+`description` field for `content` and omits `languages` from metadata,
+rather than failing the whole capture. `GITHUB_TOKEN` (optional) is sent as
+a `Bearer` header when set, raising the anonymous rate limit and reaching
+private repos the token can see; unset, it works for public repos subject
+to GitHub's low anonymous per-IP limit. **Not independently verified against
+the real GitHub API in this environment** — this development sandbox's own
+network policy intercepts all `api.github.com` traffic and requires a
+separate repo-scoping mechanism unrelated to this app's runtime, returning
+a 401/403 that has nothing to do with GitHub's actual API — so the provider
+was validated with mocked `fetch` responses matching GitHub's documented
+REST API contract instead of a live call. Worth a real end-to-end check
+once this runs somewhere without that sandbox-specific restriction.
+
+**All three new providers share the same shape:** a `FETCH_TIMEOUT_MS`
+(10s) `AbortController`-based timeout, a `CaptureProviderError` on hard
+failures with a message specific enough to show the user directly (the
+`/api/capture` route now catches `CaptureProviderError` generically and
+returns its message as a 422, alongside the existing
+`NoCaptureProviderError` 422 for genuinely unsupported input), and
+best-effort/non-fatal handling for enrichment data that isn't essential to
+having *something* worth saving.
+
 ## Risks
 
 1. **AI cost/latency** — `analyze()` is one call per item, but there's no retry/backoff yet on transient upstream failures (a timeout just fails the job; the user has to manually re-trigger `/process`).
@@ -483,6 +605,10 @@ the erroneous drop, add a small restore migration.
 14. **Assistant-turn cost is the highest per-call cost in the app so far**: one embedding call (the question) plus one Claude call with several sources' worth of text in the prompt, per message. Still cheap in absolute terms at personal-app volume, but the most expensive single interaction available in the product.
 15. **Hand-rolled index migrations, 2nd confirmed occurrence**: Sub-Phase A's `Collection`/`SavedItemCollection` migration hit the exact same auto-`DROP INDEX` issue described in risk #11, this time during a routine schema addition with no vector-related changes at all — proof it's not tied to touching embedding-adjacent models, but to *any* migration in a schema that contains the hand-written HNSW index. The mitigation (manual review + strip-and-restore) is unchanged, but the recurrence means this should be treated as a standing checklist item for every future migration, not a rare edge case.
 16. **`CaptureProviderRegistry` has exactly one concrete provider (`NoteCaptureProvider`) as of Sub-Phase A** — any URL or file capture currently 422s with "nothing can capture this input yet." This is intentional scaffolding (Sub-Phase B adds `WebProvider`/`YouTubeProvider`/`GitHubProvider`), but it means `POST /api/capture` is not yet the universal entry point the Albo layer is aiming for.
+17. **Local/self-hosted models are unvalidated against a real Ollama/NIM instance** — the `openai-compatible` adapters are tested against a mocked SDK client (correct request shape, error handling), not against a live Ollama or NIM server in this environment. A real local model's JSON-following discipline is typically weaker than Claude's for the strict extraction/assistant schemas this app validates against — expect a higher `AIResponseValidationError`/`AssistantResponseValidationError` rate than with Claude, with no fallback/retry-with-different-model logic built for that case yet.
+18. **Switching `EMBEDDING_PROVIDER` after items are already indexed silently produces a mixed-dimension mess if the column isn't resized first** — see "Local / self-hosted model backends" above. There's no guard today that stops you from pointing `EMBEDDING_PROVIDER` at a different-width model without also migrating the column; it would simply fail at insert time (pgvector enforces the column's fixed width), not corrupt data, but the failure mode isn't a friendly one.
+19. **`GitHubCaptureProvider` couldn't be smoke-tested against the real GitHub API** in this development environment — its sandbox's own network policy intercepts `api.github.com` and requires a separate repo-scoping step unrelated to this app, unlike `WebCaptureProvider` and `YouTubeCaptureProvider`'s target hosts which were reachable and verified live. The provider's logic matches GitHub's documented REST API contract and is covered by mocked-fetch tests, but a real end-to-end run (public and, separately, `GITHUB_TOKEN`-authenticated) is still outstanding.
+20. **YouTube transcript scraping is inherently fragile** — it depends on an undocumented JSON blob YouTube embeds in the watch page's HTML, not a supported API. It degrades gracefully (no captions found → `transcriptAvailable: false`, capture still succeeds on oEmbed metadata alone) rather than failing the capture, but a YouTube markup change could silently drop transcript extraction entirely until the regex/parsing is updated.
 
 ## Implementation plan
 
@@ -491,5 +617,7 @@ the erroneous drop, add a small restore migration.
 - **Phase 3 (done):** `StorageProvider`/`LocalStorageProvider`, `TranscriptionProvider`/Whisper adapter, `AudioAttachment` table, `POST /api/audio/upload` + `POST /api/items/:id/transcribe` (auto-triggers the Phase 2 pipeline on success). Tests for successful/failed transcription, missing audio, and one live-DB-guarded pipeline-integration test. Still no UI — no recording/upload widget yet.
 - **Phase 4 (done):** `EmbeddingProvider`/OpenAI adapter, `Embedding` table (pgvector, HNSW index), automatic indexing on processing completion, `GET /api/search` with type/project/tag/date filters, `GET /api/items/:id/related`, global search bar + `/search` results page + related-items section on the item detail page. Tests for text-building, embedding success/failure, empty queries, and one live-DB-guarded test proving real cosine-similarity ranking with a deterministic fake embedding.
 - **Phase 5 (done):** `AssistantProvider`/Claude adapter, `Conversation`/`Message` tables, retrieval-augmented chat (`POST /api/assistant/messages`, `GET /api/assistant/conversations[/:id]`) with source-index validation against fabricated citations, `POST /api/assistant/actions/confirm` for user-confirmed knowledge actions (create task/decision/project, add reminder), a `/chat` page with conversation history, source/related-item cards, confidence, and confirm buttons. Tests for schema parsing, provider dispatch/failure per mode, source-index validation, and one live-DB-guarded test covering retrieval accuracy, missing-information short-circuiting, hallucination prevention, source attribution, and multi-turn conversation history.
-- **Sub-Phase A (done):** Albo-inspired universal capture layer, first slice. `Collection`/`SavedItemCollection` schema plus additive `SavedItem` fields (`metadata`, `importanceScore`, `saveReason`, `lastViewedAt`); `CaptureProvider`/`CaptureProviderRegistry`/`NoteCaptureProvider` abstraction and `POST /api/capture`; Collections CRUD (`/api/collections[/:id][/items[/:savedItemId]]`) plus a `/collections` list/detail UI and an "Add to collection" control on the item detail page; `analyze()`'s schema extended with `importanceScore`/`saveReason` (non-clobbering on reprocess); `markSavedItemViewed` wired into the item detail page. Tests for registry dispatch/`NoteCaptureProvider` behavior, the new AI-response fields, and one live-DB-guarded collections-integration test. See `ALBO_ANALYSIS.md` and `ALBO_INTEGRATION_PLAN.md` for the research and full Sub-Phase A-F roadmap; B (real Web/YouTube/GitHub providers), C (image/PDF), D (rediscovery), E (UI polish), F (tests+docs pass) are not started.
-- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer.
+- **Sub-Phase A (done):** Albo-inspired universal capture layer, first slice. `Collection`/`SavedItemCollection` schema plus additive `SavedItem` fields (`metadata`, `importanceScore`, `saveReason`, `lastViewedAt`); `CaptureProvider`/`CaptureProviderRegistry`/`NoteCaptureProvider` abstraction and `POST /api/capture`; Collections CRUD (`/api/collections[/:id][/items[/:savedItemId]]`) plus a `/collections` list/detail UI and an "Add to collection" control on the item detail page; `analyze()`'s schema extended with `importanceScore`/`saveReason` (non-clobbering on reprocess); `markSavedItemViewed` wired into the item detail page. Tests for registry dispatch/`NoteCaptureProvider` behavior, the new AI-response fields, and one live-DB-guarded collections-integration test. See `ALBO_ANALYSIS.md` and `ALBO_INTEGRATION_PLAN.md` for the research and full Sub-Phase A-F roadmap.
+- **Local/self-hosted model backends (done):** `OpenAICompatibleAIProvider` and `OpenAICompatibleAssistantProvider` (new classes, `openai` SDK against a configurable `baseURL`) plus a `baseURL` option added to the existing `OpenAIEmbeddingProvider` — Ollama and NVIDIA NIM both speak the OpenAI chat-completions/embeddings dialect, so one adapter per capability covers both. Selected independently per capability via `AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER=openai-compatible` env vars, defaulting to unchanged Claude/OpenAI behavior. Tests cover request shape/error handling against a mocked SDK client and the env-var-driven factory selection logic in all three modules; no live Ollama/NIM instance was available to test against in this environment.
+- **Sub-Phase B (done):** real `WebCaptureProvider` (generic HTML page extraction via `cheerio`: title/author/description/images, ARTICLE-vs-LINK length heuristic), `YouTubeCaptureProvider` (oEmbed metadata, best-effort transcript/chapter scraping), and `GitHubCaptureProvider` (repo metadata/languages/README via the GitHub REST API, optional `GITHUB_TOKEN`), registered ahead of `NoteCaptureProvider` — no schema, route, or registry-shape changes needed beyond registering the three new providers. `/api/capture` now also catches `CaptureProviderError` generically (422 with the provider's own message). Tests mock `fetch` for all three; `WebCaptureProvider` and `YouTubeCaptureProvider` were additionally verified with live smoke tests in this environment, `GitHubCaptureProvider` was not (this sandbox's own network policy blocks direct `api.github.com` access — see Risks). Image/screenshot/PDF capture (Sub-Phase C), rediscovery (D), further UI polish (E), and a final tests+docs pass (F) are not started.
+- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer; a live end-to-end check of `GitHubCaptureProvider` and the `openai-compatible` adapters outside this sandbox.

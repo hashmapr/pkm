@@ -23,12 +23,17 @@ retrieval-augmented chat over your saved knowledge with source citations,
 confidence scores, and user-confirmed knowledge actions (create a task,
 save a decision, create a project, add a reminder — nothing executes without
 an explicit confirm click). `/chat` page with conversation history.
-**Sub-Phase A (current):** first slice of an Albo-inspired universal capture
+**Sub-Phase A (done):** first slice of an Albo-inspired universal capture
 layer — `Collection`/`SavedItemCollection` for lightweight manual grouping
 alongside tags/projects, a `CaptureProvider` abstraction behind
-`POST /api/capture` (currently just plain-text notes; URL/file capture lands
-in later sub-phases), and two new AI-derived fields on each item —
+`POST /api/capture`, and two new AI-derived fields on each item —
 `importanceScore` and a plain-language `saveReason` ("why this was saved").
+**Sub-Phase B (current):** real capture providers — `WebCaptureProvider`
+(generic webpage extraction: title/author/description/images, classified
+as `LINK` or `ARTICLE`), `YouTubeCaptureProvider` (title/author via oEmbed,
+best-effort transcript + chapters), and `GitHubCaptureProvider` (README,
+languages, stars via the GitHub REST API) — `POST /api/capture` now handles
+URLs from any of these sources, not just plain text.
 See ALBO_ANALYSIS.md and ALBO_INTEGRATION_PLAN.md for the research behind
 this and the full Sub-Phase A-F roadmap, and ARCHITECTURE.md for the full
 design.
@@ -42,6 +47,29 @@ npm install
 npm run prisma:migrate
 npm run dev
 ```
+
+### Running on local models (Ollama / NVIDIA NIM) instead of cloud APIs
+
+`AIProvider`, `AssistantProvider`, and `EmbeddingProvider` can each
+independently point at any backend that speaks the OpenAI-compatible chat/
+embeddings API — Ollama and NVIDIA NIM both qualify — instead of
+Claude/OpenAI. Set in `.env` (all optional; unset keeps the cloud defaults):
+
+```bash
+AI_PROVIDER="openai-compatible"          # extraction
+ASSISTANT_PROVIDER="openai-compatible"   # /chat
+EMBEDDING_PROVIDER="openai-compatible"   # search
+OPENAI_COMPATIBLE_BASE_URL="http://localhost:11434/v1"  # Ollama's OpenAI-compat endpoint, or your NIM endpoint
+OPENAI_COMPATIBLE_MODEL="llama3.1"
+OPENAI_COMPATIBLE_EMBEDDING_MODEL="nomic-embed-text"
+OPENAI_COMPATIBLE_EMBEDDING_DIMENSIONS="768"   # must match the model's real output width
+```
+
+Switching `EMBEDDING_PROVIDER` to a model with a different output width than
+1536 (OpenAI's default) requires resizing the `embeddings.vector` column
+first — see ARCHITECTURE.md's "Local / self-hosted model backends" section
+before flipping that one. Transcription (Whisper) has no local adapter yet
+and still needs `OPENAI_API_KEY` regardless of these switches.
 
 Open http://localhost:3000, create an account, and start saving items.
 Trigger processing for a saved item with `POST /api/items/:id/process`
@@ -91,15 +119,31 @@ curl -b cookies.txt -X POST http://localhost:3000/api/assistant/actions/confirm 
 Or just use the `/chat` page, with the mode buttons (Ask / Summarize /
 Compare / Find conflicts) above the input box.
 
-Capture a plain-text note through the universal capture endpoint, and manage
-collections:
+Capture a plain-text note, a webpage, a YouTube video, or a GitHub repo
+through the same universal capture endpoint, and manage collections:
 
 ```bash
 curl -b cookies.txt -X POST http://localhost:3000/api/capture \
   -H "Content-Type: application/json" \
   -d '{"text":"Idea: try a graph-based agent orchestrator"}'
 # -> { "item": { "id": "...", "type": "NOTE", ... } }
-# a "url" instead of "text" currently 422s — no URL capture provider yet
+
+curl -b cookies.txt -X POST http://localhost:3000/api/capture \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/some-article"}'
+# -> { "item": { "id": "...", "type": "LINK" | "ARTICLE", ... } }
+
+curl -b cookies.txt -X POST http://localhost:3000/api/capture \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
+# -> { "item": { "id": "...", "type": "YOUTUBE", ... } } — transcript is best-effort,
+# capture still succeeds on title/author alone if no captions are found
+
+curl -b cookies.txt -X POST http://localhost:3000/api/capture \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://github.com/anthropics/claude-code"}'
+# -> { "item": { "id": "...", "type": "GITHUB", ... } } — set GITHUB_TOKEN to
+# raise GitHub's low anonymous rate limit or reach private repos
 
 curl -b cookies.txt -X POST http://localhost:3000/api/collections \
   -H "Content-Type: application/json" -d '{"name":"AI","emoji":"🤖"}'
@@ -125,9 +169,18 @@ handling, the search service's empty-query guard and highlight logic, and
 the assistant's response parsing, per-mode provider dispatch/failure, and
 source-index validation (the hallucination-prevention mechanism), the
 `CaptureProviderRegistry`'s dispatch order/no-match behavior and
-`NoteCaptureProvider`'s title derivation, and the new `importanceScore`/
-`saveReason` fields on the AI extraction schema — all against pure functions
-and fake providers, no live database or network call required.
+`NoteCaptureProvider`'s title derivation, the new `importanceScore`/
+`saveReason` fields on the AI extraction schema, the
+`OpenAICompatibleAIProvider`/`OpenAICompatibleAssistantProvider` request
+shape and error handling against a mocked SDK client, the
+`AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER` factory selection
+logic (env-var-driven, defaults preserved, required-config errors), and
+`WebCaptureProvider`/`YouTubeCaptureProvider`/`GitHubCaptureProvider`'s
+extraction, classification, and error handling against a mocked `fetch` —
+all against pure functions and fake/mocked providers, no live database,
+network call, or real Ollama/NIM/GitHub-API access required (though
+`WebCaptureProvider` and `YouTubeCaptureProvider` were additionally smoke-
+tested against real live requests; see ARCHITECTURE.md for what wasn't).
 
 Four tests need a real database (pgvector) and skip cleanly if none is
 reachable: `audio-pipeline.integration.test.ts` (transcribe → content update
