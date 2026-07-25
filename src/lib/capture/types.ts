@@ -9,6 +9,15 @@ export interface CaptureInput {
   file?: { buffer: Buffer; filename: string; mimeType: string };
   /** Optional user-provided title hint; providers may use it or override it with something better extracted from the content. */
   title?: string;
+  /**
+   * Disambiguates an image file's SavedItemType — whether pixels alone are a
+   * screenshot vs. a photo isn't reliably decidable without the vision
+   * analysis this hint is meant to route *to*, so it's caller-supplied
+   * (e.g. "paste a screenshot" vs. "upload an image" in a future UI) rather
+   * than inferred. Defaults to IMAGE when omitted; ignored by any provider
+   * that isn't image-specific.
+   */
+  hint?: 'IMAGE' | 'SCREENSHOT';
 }
 
 export interface CaptureResult {

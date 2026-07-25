@@ -18,8 +18,9 @@ structured, searchable **Saved Item**.
 | Embeddings | Provider abstraction in `src/lib/embeddings/` (Phase 4) | `EmbeddingProvider` interface + OpenAI (`text-embedding-3-small`) adapter — its own abstraction, same reasoning as Transcription vs. AI. |
 | Vector search | pgvector (Phase 4) | Same Postgres instance as everything else; `Unsupported("vector(1536)")` column + raw SQL for similarity queries, HNSW index for cosine distance. |
 | AI assistant | Provider abstraction in `src/lib/assistant/` (Phase 5) | `AssistantProvider` interface + Claude adapter — its own abstraction (not new `AIProvider` methods), same reasoning as Transcription/Embeddings: different capability, independently swappable, even though currently the same vendor. |
-| Universal capture | Provider abstraction in `src/lib/capture/` (Albo layer, Sub-Phase A/B) | `CaptureProvider` interface (`supports`/`capture`) + a registry, so adding a new source type (web, YouTube, GitHub, PDF, image) means writing one provider and registering it — no call-site changes to `POST /api/capture`. |
+| Universal capture | Provider abstraction in `src/lib/capture/` (Albo layer, Sub-Phase A/B/C) | `CaptureProvider` interface (`supports`/`capture`) + a registry, so adding a new source type (web, YouTube, GitHub, PDF, image, screenshot) means writing one provider and registering it — no call-site changes to `POST /api/capture`. |
 | Local/self-hosted models | `OpenAICompatibleAIProvider` / `OpenAICompatibleAssistantProvider` / `OpenAIEmbeddingProvider`'s `baseURL` option | Ollama and NVIDIA NIM both speak the OpenAI chat-completions and embeddings request shape, so one adapter per capability covers both vendors instead of two — selected per-capability via `AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER` env vars, defaulting to Claude/OpenAI unchanged. |
+| Image understanding | Provider abstraction in `src/lib/vision/` (Sub-Phase C) | `VisionProvider` interface + `ClaudeVisionProvider` adapter (Anthropic SDK image content blocks) — its own abstraction, same reasoning as Transcription/Embeddings/Assistant: multimodal input is a different capability from a vendor that could plausibly differ from the text-only `AIProvider`. |
 
 **Layering rule:** route handlers stay thin (parse request → call a service in
 `src/lib/services` → return response). All business logic lives in services so
@@ -587,6 +588,74 @@ returns its message as a 422, alongside the existing
 best-effort/non-fatal handling for enrichment data that isn't essential to
 having *something* worth saving.
 
+## Albo-inspired layer, Sub-Phase C (image, screenshot, PDF capture)
+
+Three more concrete `CaptureProvider`s, plus a new `VisionProvider`
+abstraction they share: `ScreenshotCaptureProvider` and
+`ImageCaptureProvider` (both registered before `PDFCaptureProvider`, which
+sits before `NoteCaptureProvider`) and `PDFCaptureProvider`. `POST
+/api/capture` now accepts `multipart/form-data` (a `file` field) alongside
+its existing JSON body for `url`/`text` — the route branches on
+content-type, but dispatch itself is unchanged, same as every prior
+sub-phase's promise.
+
+**Distinguishing a screenshot from a photo can't be done from pixels
+alone** without the very vision analysis this distinction is meant to route
+*to* — a chicken-and-egg problem. So `CaptureInput` gained an optional
+`hint: 'IMAGE' | 'SCREENSHOT'` field, supplied by the caller (a future UI's
+"paste a screenshot" vs. "upload a photo" action, or the `hint` form field
+today), defaulting to `IMAGE` when omitted. `ImageCaptureProvider.supports()`
+matches any image file *without* the SCREENSHOT hint; `ScreenshotCaptureProvider`
+matches only *with* it — mutually exclusive by construction, so registration
+order between the two doesn't actually matter (Screenshot is registered
+first anyway, for readability, matching the "more specific first" convention).
+
+**`VisionProvider`** (`src/lib/vision/`) is its own abstraction — not new
+`AIProvider` methods — for the same reason `TranscriptionProvider`/
+`EmbeddingProvider`/`AssistantProvider` are separate from it: multimodal
+image understanding is a different capability that could plausibly swap
+vendors independently. `ClaudeVisionProvider` sends the image as a base64
+`image` content block (Anthropic's Messages API) alongside a JSON-only
+prompt asking for `{ description, extractedText }`, with a
+screenshot-specific prompt variant emphasizing "what app/UI is this and
+transcribe its text accurately" vs. a photo-oriented "describe the subject,
+transcribe any visible text if present." Reuses `ANTHROPIC_API_KEY` — no
+new vendor/key for this capability. **Important ordering detail:** both
+`ImageCaptureProvider` and `ScreenshotCaptureProvider` resolve their
+`VisionProvider` *lazily inside `capture()`*, not in their constructors —
+constructing the registry (which happens on every request, not just image
+ones) must not eagerly require `ANTHROPIC_API_KEY` just because an image
+provider exists in it.
+
+**`PDFCaptureProvider` is pinned to `pdf-parse@1.x`, not the current 2.x
+line, and this was a real, confirmed compatibility bug, not a style
+choice.** 2.x rebuilds on a newer `pdfjs-dist` ESM build; a real `npm run
+dev` request against it crashed at webpack module-evaluation time
+("`Object.defineProperty called on non-object`") when the route bundled
+`pdf-parse`'s ESM entrypoint — this reproduced in the actual dev server, not
+just in tests. It also failed differently (`DataCloneError` from pdf.js's
+worker-fallback message-passing) when merely unit-tested under Vitest, even
+using the library entirely correctly per its own docs. 1.x is a plain-CJS
+wrapper around an older pdf.js with none of this trouble, confirmed via a
+live smoke test end-to-end (multipart upload → real extracted text/author →
+served-back byte-identical attachment). `@types/pdf-parse` supplies the
+types 1.x doesn't ship itself.
+
+**File storage for image/screenshot/PDF captures reuses the `Attachment`
+model** — defined since Phase 1's original schema but never actually
+written to until now (Phase 3's `AudioAttachment` is a separate, 1:1,
+transcript-specific table). Upload happens in `captureItem()` (the service
+layer), not inside any individual `CaptureProvider` — providers stay pure
+content-extraction, the same separation of concerns Web/YouTube/GitHub
+already established by never touching storage or the database themselves.
+A new `GET /api/attachments/file/[key]` route serves them, scoped to the
+requesting user's own attachment — unlike `/api/audio/file/[key]`, which
+has to *guess* mime type from the storage key's extension (Phase 3's
+`AudioAttachment` has no mime-type column), `Attachment.mimeType` is a real
+stored column, so serving is exact. A 25MB cap (`MAX_CAPTURE_FILE_BYTES`,
+matching Whisper's real limit reused as a sane generic default) is enforced
+before any provider or storage call, in `captureItem()` itself.
+
 ## Risks
 
 1. **AI cost/latency** — `analyze()` is one call per item, but there's no retry/backoff yet on transient upstream failures (a timeout just fails the job; the user has to manually re-trigger `/process`).
@@ -609,6 +678,9 @@ having *something* worth saving.
 18. **Switching `EMBEDDING_PROVIDER` after items are already indexed silently produces a mixed-dimension mess if the column isn't resized first** — see "Local / self-hosted model backends" above. There's no guard today that stops you from pointing `EMBEDDING_PROVIDER` at a different-width model without also migrating the column; it would simply fail at insert time (pgvector enforces the column's fixed width), not corrupt data, but the failure mode isn't a friendly one.
 19. **`GitHubCaptureProvider` couldn't be smoke-tested against the real GitHub API** in this development environment — its sandbox's own network policy intercepts `api.github.com` and requires a separate repo-scoping step unrelated to this app, unlike `WebCaptureProvider` and `YouTubeCaptureProvider`'s target hosts which were reachable and verified live. The provider's logic matches GitHub's documented REST API contract and is covered by mocked-fetch tests, but a real end-to-end run (public and, separately, `GITHUB_TOKEN`-authenticated) is still outstanding.
 20. **YouTube transcript scraping is inherently fragile** — it depends on an undocumented JSON blob YouTube embeds in the watch page's HTML, not a supported API. It degrades gracefully (no captions found → `transcriptAvailable: false`, capture still succeeds on oEmbed metadata alone) rather than failing the capture, but a YouTube markup change could silently drop transcript extraction entirely until the regex/parsing is updated.
+21. **`pdf-parse` is pinned to the 1.x line, deliberately behind latest** — the 2.x line crashes when bundled into a Next.js server route (see "Sub-Phase C" above); revisit the pin only after confirming a specific 2.x+ release actually works under real webpack bundling, not just in isolated Node scripts.
+22. **Image/screenshot capture cost is the second-highest per-call cost in the app** (after assistant turns) — one Claude vision call per capture, in addition to the existing `analyze()` call every saved item gets during processing. Two Claude calls per image captured, not one.
+23. **Screenshot-vs-image is a caller-supplied hint, easily gotten wrong** — nothing validates that a caller claiming `hint: 'screenshot'` actually uploaded a screenshot; worst case is a slightly-mismatched prompt emphasis (asking "what app is this" of an actual photo), not a broken capture.
 
 ## Implementation plan
 
@@ -619,5 +691,6 @@ having *something* worth saving.
 - **Phase 5 (done):** `AssistantProvider`/Claude adapter, `Conversation`/`Message` tables, retrieval-augmented chat (`POST /api/assistant/messages`, `GET /api/assistant/conversations[/:id]`) with source-index validation against fabricated citations, `POST /api/assistant/actions/confirm` for user-confirmed knowledge actions (create task/decision/project, add reminder), a `/chat` page with conversation history, source/related-item cards, confidence, and confirm buttons. Tests for schema parsing, provider dispatch/failure per mode, source-index validation, and one live-DB-guarded test covering retrieval accuracy, missing-information short-circuiting, hallucination prevention, source attribution, and multi-turn conversation history.
 - **Sub-Phase A (done):** Albo-inspired universal capture layer, first slice. `Collection`/`SavedItemCollection` schema plus additive `SavedItem` fields (`metadata`, `importanceScore`, `saveReason`, `lastViewedAt`); `CaptureProvider`/`CaptureProviderRegistry`/`NoteCaptureProvider` abstraction and `POST /api/capture`; Collections CRUD (`/api/collections[/:id][/items[/:savedItemId]]`) plus a `/collections` list/detail UI and an "Add to collection" control on the item detail page; `analyze()`'s schema extended with `importanceScore`/`saveReason` (non-clobbering on reprocess); `markSavedItemViewed` wired into the item detail page. Tests for registry dispatch/`NoteCaptureProvider` behavior, the new AI-response fields, and one live-DB-guarded collections-integration test. See `ALBO_ANALYSIS.md` and `ALBO_INTEGRATION_PLAN.md` for the research and full Sub-Phase A-F roadmap.
 - **Local/self-hosted model backends (done):** `OpenAICompatibleAIProvider` and `OpenAICompatibleAssistantProvider` (new classes, `openai` SDK against a configurable `baseURL`) plus a `baseURL` option added to the existing `OpenAIEmbeddingProvider` — Ollama and NVIDIA NIM both speak the OpenAI chat-completions/embeddings dialect, so one adapter per capability covers both. Selected independently per capability via `AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER=openai-compatible` env vars, defaulting to unchanged Claude/OpenAI behavior. Tests cover request shape/error handling against a mocked SDK client and the env-var-driven factory selection logic in all three modules; no live Ollama/NIM instance was available to test against in this environment.
-- **Sub-Phase B (done):** real `WebCaptureProvider` (generic HTML page extraction via `cheerio`: title/author/description/images, ARTICLE-vs-LINK length heuristic), `YouTubeCaptureProvider` (oEmbed metadata, best-effort transcript/chapter scraping), and `GitHubCaptureProvider` (repo metadata/languages/README via the GitHub REST API, optional `GITHUB_TOKEN`), registered ahead of `NoteCaptureProvider` — no schema, route, or registry-shape changes needed beyond registering the three new providers. `/api/capture` now also catches `CaptureProviderError` generically (422 with the provider's own message). Tests mock `fetch` for all three; `WebCaptureProvider` and `YouTubeCaptureProvider` were additionally verified with live smoke tests in this environment, `GitHubCaptureProvider` was not (this sandbox's own network policy blocks direct `api.github.com` access — see Risks). Image/screenshot/PDF capture (Sub-Phase C), rediscovery (D), further UI polish (E), and a final tests+docs pass (F) are not started.
-- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer; a live end-to-end check of `GitHubCaptureProvider` and the `openai-compatible` adapters outside this sandbox.
+- **Sub-Phase B (done):** real `WebCaptureProvider` (generic HTML page extraction via `cheerio`: title/author/description/images, ARTICLE-vs-LINK length heuristic), `YouTubeCaptureProvider` (oEmbed metadata, best-effort transcript/chapter scraping), and `GitHubCaptureProvider` (repo metadata/languages/README via the GitHub REST API, optional `GITHUB_TOKEN`), registered ahead of `NoteCaptureProvider` — no schema, route, or registry-shape changes needed beyond registering the three new providers. `/api/capture` now also catches `CaptureProviderError` generically (422 with the provider's own message). Tests mock `fetch` for all three; `WebCaptureProvider` and `YouTubeCaptureProvider` were additionally verified with live smoke tests in this environment, `GitHubCaptureProvider` was not (this sandbox's own network policy blocks direct `api.github.com` access — see Risks).
+- **Sub-Phase C (done):** `VisionProvider`/`ClaudeVisionProvider` (new abstraction, image description + OCR), `ImageCaptureProvider` and `ScreenshotCaptureProvider` (disambiguated by a caller-supplied `hint`, not pixel inference), and `PDFCaptureProvider` (pinned to `pdf-parse@1.x` after 2.x crashed under real Next.js bundling — see Risks). `POST /api/capture` now accepts `multipart/form-data` file uploads alongside its existing JSON url/text body; file-based captures get their bytes persisted as an `Attachment` (Phase 1's schema, first real writer) and served via a new `GET /api/attachments/file/[key]`. Tests mock the Claude vision client and `pdf-parse`; `PDFCaptureProvider`, `WebCaptureProvider`, and `YouTubeCaptureProvider`'s capture paths were additionally verified end-to-end with a live smoke test (a real PDF captured, parsed, and served back byte-identical); the image/screenshot vision call itself couldn't be positively verified without a real `ANTHROPIC_API_KEY`, but its failure path (422 with a clear message, no crash) was. Rediscovery (D), further UI polish (E — there is still no capture UI at all, only the API), and a final tests+docs pass (F) are not started.
+- **Follow-up:** background queue worker (see migration path in Phase 2, now applies to `/process`, `/transcribe`, `/search`, and `/assistant/messages`); UI to surface extracted tasks/entities/decisions/questions and audio playback/recording; embedding backfill for pre-Phase-4 items; chunk-level embeddings for true passage highlighting; query-rewriting for follow-up questions; streaming assistant responses instead of waiting for the full answer; a live end-to-end check of `GitHubCaptureProvider`, the `openai-compatible` adapters, and real Claude-vision image analysis outside this sandbox; re-evaluate the `pdf-parse` 1.x pin once a newer release's Next.js-bundling compatibility is confirmed.

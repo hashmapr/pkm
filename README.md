@@ -28,12 +28,18 @@ layer — `Collection`/`SavedItemCollection` for lightweight manual grouping
 alongside tags/projects, a `CaptureProvider` abstraction behind
 `POST /api/capture`, and two new AI-derived fields on each item —
 `importanceScore` and a plain-language `saveReason` ("why this was saved").
-**Sub-Phase B (current):** real capture providers — `WebCaptureProvider`
+**Sub-Phase B (done):** real capture providers — `WebCaptureProvider`
 (generic webpage extraction: title/author/description/images, classified
 as `LINK` or `ARTICLE`), `YouTubeCaptureProvider` (title/author via oEmbed,
 best-effort transcript + chapters), and `GitHubCaptureProvider` (README,
 languages, stars via the GitHub REST API) — `POST /api/capture` now handles
 URLs from any of these sources, not just plain text.
+**Sub-Phase C (current):** file-upload capture — `ImageCaptureProvider` and
+`ScreenshotCaptureProvider` (Claude vision: description + OCR, via a new
+`VisionProvider` abstraction), and `PDFCaptureProvider` (text/metadata
+extraction) — `POST /api/capture` now also accepts `multipart/form-data`
+file uploads, with the raw file persisted as an `Attachment` and served back
+via `GET /api/attachments/file/[key]`.
 See ALBO_ANALYSIS.md and ALBO_INTEGRATION_PLAN.md for the research behind
 this and the full Sub-Phase A-F roadmap, and ARCHITECTURE.md for the full
 design.
@@ -145,6 +151,21 @@ curl -b cookies.txt -X POST http://localhost:3000/api/capture \
 # -> { "item": { "id": "...", "type": "GITHUB", ... } } — set GITHUB_TOKEN to
 # raise GitHub's low anonymous rate limit or reach private repos
 
+curl -b cookies.txt -X POST http://localhost:3000/api/capture \
+  -F "file=@photo.jpg;type=image/jpeg"
+# -> { "item": { "id": "...", "type": "IMAGE", ... } } — requires ANTHROPIC_API_KEY
+# (Claude vision describes + OCRs the image); add -F "hint=screenshot" to
+# capture as SCREENSHOT instead (a different prompt, geared at UI/app content)
+
+curl -b cookies.txt -X POST http://localhost:3000/api/capture \
+  -F "file=@document.pdf;type=application/pdf"
+# -> { "item": { "id": "...", "type": "PDF", ... } } — no API key needed,
+# text/author/page-count extracted locally
+
+curl -b cookies.txt "http://localhost:3000/api/attachments/file/<key>"
+# serves the raw uploaded file back — <key> comes from
+# item.attachments[].storagePath in the capture response above
+
 curl -b cookies.txt -X POST http://localhost:3000/api/collections \
   -H "Content-Type: application/json" -d '{"name":"AI","emoji":"🤖"}'
 curl -b cookies.txt -X POST http://localhost:3000/api/collections/<id>/items \
@@ -176,11 +197,20 @@ shape and error handling against a mocked SDK client, the
 `AI_PROVIDER`/`ASSISTANT_PROVIDER`/`EMBEDDING_PROVIDER` factory selection
 logic (env-var-driven, defaults preserved, required-config errors), and
 `WebCaptureProvider`/`YouTubeCaptureProvider`/`GitHubCaptureProvider`'s
-extraction, classification, and error handling against a mocked `fetch` —
-all against pure functions and fake/mocked providers, no live database,
-network call, or real Ollama/NIM/GitHub-API access required (though
-`WebCaptureProvider` and `YouTubeCaptureProvider` were additionally smoke-
-tested against real live requests; see ARCHITECTURE.md for what wasn't).
+extraction, classification, and error handling against a mocked `fetch`,
+`ClaudeVisionProvider`'s image-content-block request shape and error
+handling against a mocked SDK client, `ImageCaptureProvider`/
+`ScreenshotCaptureProvider`'s hint-based dispatch and content-building
+against a fake `VisionProvider`, `PDFCaptureProvider`'s text/metadata
+mapping against a mocked `pdf-parse`, and `captureItem`'s file-size
+validation and storage/`Attachment`-creation logic against a mocked
+database — all against pure functions and fake/mocked providers, no live
+database, network call, or real Ollama/NIM/GitHub-API/Claude-vision access
+required (though `WebCaptureProvider`, `YouTubeCaptureProvider`, and
+`PDFCaptureProvider`'s full capture-to-served-attachment path were
+additionally smoke-tested against real live requests; see ARCHITECTURE.md
+for what wasn't, including why `PDFCaptureProvider` is pinned to
+`pdf-parse@1.x`).
 
 Four tests need a real database (pgvector) and skip cleanly if none is
 reachable: `audio-pipeline.integration.test.ts` (transcribe → content update
